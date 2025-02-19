@@ -369,6 +369,8 @@ class DynamoTLS(threading.local):
     # Each string is a summary of a frame Dynamo attempted to trace, stored in
     # temporal order.
     traced_frame_infos: list[str] = []
+    # RAYJIT
+    top_level_module: Optional[torch.nn.Module] = None
 
 
 dynamo_tls = DynamoTLS()
@@ -480,6 +482,10 @@ class _TorchDynamoContext:
 
         # Optimize the forward method of torch.nn.Module object
         if isinstance(fn, torch.nn.Module):
+            # RAYJIT
+            print(f"Compiling top-level module {fn.__class__.__name__}")
+            dynamo_tls.top_level_module = fn
+
             mod = fn
             new_mod = OptimizedModule(mod, self)
             # Save the function pointer to find the original callable while nesting

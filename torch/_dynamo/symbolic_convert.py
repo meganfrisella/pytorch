@@ -1014,6 +1014,9 @@ class InstructionTranslatorBase(
             and self.is_non_empty_graph()
         ):
             self.current_speculation = self.speculate()
+            # RAYJIT
+            if self.current_speculation.inst.argval == "partition":
+                return self.partition_graph_break(inst)
             if self.current_speculation.failed:
                 return self.step_graph_break(inst)
 
@@ -1941,6 +1944,24 @@ class InstructionTranslatorBase(
         self.popn(2)
         self.output.add_output_instructions(
             self.create_call_resume_at(self.next_instruction)
+        )
+
+    # RAYJIT
+    def partition_graph_break(self, inst):
+        log_graph_break(self.code_options, reason="PARTITION-caused graph break")
+        if not self.should_compile_partial_graph():
+            unimplemented("should_compile_partial_graph=False")
+        self.output.compile_subgraph(
+            self, 
+            partial_convert=True,
+            reason=GraphCompileReason("partition", [self.frame_summary()]),
+        )
+        # skip the hint `_ = "partition"`
+        self.instruction_pointer += 1
+        # create a return-resume after the hint. 
+        # TODO: return args needed by next stage but do not call directly into next stage
+        self.output.add_output_instructions(
+            self.create_call_resume_at(self.instructions[self.instruction_pointer])
         )
 
     def DELETE_ATTR(self, inst):

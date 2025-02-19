@@ -125,7 +125,6 @@ from .utils import (
 )
 from .variables.torch_function import torch_function_mode_stack_state_mgr
 
-
 np: Optional[ModuleType]
 try:
     import numpy as np
@@ -561,7 +560,7 @@ class ConvertFrameAssert:
             dynamo_tls.traced_frame_infos.append(info)
 
         with compile_context(CompileContext(compile_id)):
-            return _compile(
+            out = _compile(
                 frame.f_code,
                 frame.f_globals,
                 frame.f_locals,
@@ -579,6 +578,10 @@ class ConvertFrameAssert:
                 compile_id=compile_id,
                 skip=skip + 1,
             )
+            # RAYJIT
+            print(f"HERE Finished compiling frame {frame.f_code.co_name}")
+            setattr(dynamo_tls.top_level_module, "rayjit_" + frame.f_code.co_name, out.code)
+            return out
 
 
 def convert_frame_assert(

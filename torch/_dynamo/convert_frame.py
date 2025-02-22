@@ -1,6 +1,7 @@
 # mypy: allow-untyped-decorators
 from __future__ import annotations
 
+from IPython.core.debugger import set_trace
 import collections
 import contextlib
 import cProfile
@@ -124,6 +125,7 @@ from .utils import (
     write_record_to_file,
 )
 from .variables.torch_function import torch_function_mode_stack_state_mgr
+from .generate_ray import generate_stage_and_ray_actor
 
 np: Optional[ModuleType]
 try:
@@ -579,8 +581,10 @@ class ConvertFrameAssert:
                 skip=skip + 1,
             )
             # RAYJIT
-            print(f"HERE Finished compiling frame {frame.f_code.co_name}")
-            setattr(dynamo_tls.top_level_module, "rayjit_" + frame.f_code.co_name, out.code)
+            print(f"Finished compiling frame {frame.f_code.co_name}")
+            stage = generate_stage_and_ray_actor(dynamo_tls.current_module, out.code)
+            dynamo_tls.current_stages.append(stage)
+            # set_trace()
             return out
 
 

@@ -22,6 +22,8 @@ def generate_stage_and_ray_actor(mod: torch.nn.Module, code: types.CodeType):
   fwd_args = list(code.co_varnames[1:code.co_argcount])
   fwd_args = ", ".join(fwd_args)
 
+  stage_name = f"{mod_name}_{fwd_name}_Stage"
+
   # the stage has all the attributes of the top level module (for now)
   # TODO: the new module should only get attributes necessary for this stage
   attrs = {}
@@ -29,11 +31,12 @@ def generate_stage_and_ray_actor(mod: torch.nn.Module, code: types.CodeType):
     if not callable(val) and not name.startswith("__"):
       attrs[name] = val
 
-  # the stage's forward method
+  # additional attributes
   attrs[fwd_name] = code
+  attrs["fwd_name"] = fwd_name
+  attrs["name"] = stage_name
 
   # create a new module for this stage
-  stage_name = f"{mod_name}_{fwd_name}_Stage"
   stage_class = type(stage_name, (), attrs)
   stage = stage_class()
 
@@ -49,20 +52,48 @@ def generate_stage_and_ray_actor(mod: torch.nn.Module, code: types.CodeType):
   mod_filename = top_level_path.stem
 
   # create a ray actor that wraps the new stage
-  ray_code = f"""\n
-import ray
-import torch
-from {mod_filename} import {mod_name}
+  ray_code = f"""
+import ray.dag
 
 @ray.remote
 class {stage_name}_Actor:
   def __init__(self):
-    self.model = {mod_name}.{stage_name}
+    self.model = compiled.{stage_name}
   
-  def forward(self, {fwd_args}):
+  def {fwd_name}(self, {fwd_args}):
     self.pred = self.model.{fwd_name}({fwd_args})
     return self.pred
+
 """
   # append the actor to the output file
   with out_path.open("a") as f:
     f.write(ray_code)
+  
+  return stage
+
+
+def generate_schedule(mod_name: str, stages: list[torch.nn.Module]):
+  out_path = top_level_path.parent / f"{mod_name}_ray.py"
+
+  num_stages = len(stages)
+  assert(num_stages == 2) # only handles 2-stage pipelines for now
+
+  ray_code = [f"actor_{stage.name} = {stage.name}_Actor.remote()" for stage in stages]
+
+  stage_1 = stages[0]
+  stage_2 = stages[1]
+
+  ray_code.append(f"""\n
+with ray.dag.InputNode() as inp:
+   dag = actor_{stage_1.name}.{stage_1.fwd_name}.bind(inp)
+   dag = actor_{stage_2.name}.{stage_2.fwd_name}.bind(inp)
+   # TODO: dag = actor2.backward.bind(dag)
+   # TODO: dag = actor1.backward.bind(dag)
+""")
+
+  ray_code = '\n'.join(ray_code)
+
+  with out_path.open("a") as f:
+    f.write(ray_code)
+  
+  return out_path

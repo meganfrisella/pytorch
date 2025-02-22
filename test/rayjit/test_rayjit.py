@@ -38,16 +38,6 @@ assert torch.all(torch.eq(out1, out2))
 print("tensors are equal!")
 
 
-# get the pipeline stages from the compiled model
-
-partitions = [f for f in compiled.__dir__() if 'rayjit' in f]
-for f in partitions:
-    code = getattr(compiled, f)
-    print(code)
-    # this doesn't work: cannot `exec` a code object that requires params
-    print(exec(code, {"self": compiled, "x": x_train}))
-
-
 # training loop
 
 """

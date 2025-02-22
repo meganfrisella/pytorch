@@ -29,6 +29,9 @@ from enum import Enum
 from os.path import dirname, join
 from typing import Any, Callable, NamedTuple, Optional, TYPE_CHECKING, Union
 from unittest.mock import patch
+from pathlib import Path
+
+from IPython.core.debugger import set_trace
 
 import sympy
 
@@ -73,6 +76,7 @@ from .hooks import Hooks
 from .mutation_guard import install_generation_tagging_init
 from .utils import common_constant_types, compile_times
 
+from .generate_ray import generate_schedule
 
 if TYPE_CHECKING:
     from torch._subclasses import fake_tensor
@@ -370,7 +374,8 @@ class DynamoTLS(threading.local):
     # temporal order.
     traced_frame_infos: list[str] = []
     # RAYJIT
-    top_level_module: Optional[torch.nn.Module] = None
+    current_module: Optional[torch.nn.Module] = None
+    current_stages: list[torch.nn.Module] = []
 
 
 dynamo_tls = DynamoTLS()
@@ -484,7 +489,7 @@ class _TorchDynamoContext:
         if isinstance(fn, torch.nn.Module):
             # RAYJIT
             print(f"Compiling top-level module {fn.__class__.__name__}")
-            dynamo_tls.top_level_module = fn
+            dynamo_tls.current_module = fn
 
             mod = fn
             new_mod = OptimizedModule(mod, self)
@@ -579,6 +584,14 @@ class _TorchDynamoContext:
                     # data in the TorchDynamo frames, so we strip them out.
                     raise e.remove_dynamo_frames() from None  # see TORCHDYNAMO_VERBOSE=1
                 finally:
+                    # RAYJIT
+                    print(f"Finished compiling top-level module {fn.__class__.__name__}")
+                    # set_trace()
+                    out_path = generate_schedule(
+                        dynamo_tls.current_module.__class__.__name__, 
+                        dynamo_tls.current_stages)
+                    exec(open(out_path).read(), {"compiled": dynamo_tls.current_module})
+
                     # Restore the dynamic layer stack depth if necessary.
                     set_eval_frame(None)
                     torch._C._functorch.pop_dynamic_layer_stack_and_undo_to_depth(

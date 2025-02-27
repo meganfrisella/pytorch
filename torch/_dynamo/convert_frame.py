@@ -20,6 +20,7 @@ import time
 import traceback
 import typing
 import weakref
+import types
 from pathlib import Path
 from types import CellType, CodeType, FunctionType, ModuleType
 from typing import Any, Callable, Optional, TypeVar, Union
@@ -562,7 +563,7 @@ class ConvertFrameAssert:
             dynamo_tls.traced_frame_infos.append(info)
 
         with compile_context(CompileContext(compile_id)):
-            out = _compile(
+            return _compile(
                 frame.f_code,
                 frame.f_globals,
                 frame.f_locals,
@@ -580,12 +581,6 @@ class ConvertFrameAssert:
                 compile_id=compile_id,
                 skip=skip + 1,
             )
-            # RAYJIT
-            print(f"Finished compiling frame {frame.f_code.co_name}")
-            stage = generate_stage_and_ray_actor(dynamo_tls.current_module, out.code)
-            dynamo_tls.current_stages.append(stage)
-            # set_trace()
-            return out
 
 
 def convert_frame_assert(
@@ -679,6 +674,7 @@ def _compile(
             frame_state=frame_state,
             speculation_log=speculation_log,
             distributed_state=distributed_state,
+            is_pipeline_stage=dynamo_tls.compiling_pipeline,
         )
 
         try:
@@ -948,6 +944,14 @@ def _compile(
                 # do not recursively skip frames
                 unimplemented(f"{limit_type} reached")
 
+        def log_bytecode(
+            prefix: str, name: str, filename: str, line_no: int, code: CodeType
+        ) -> None:
+            if bytecode_log.isEnabledFor(logging.DEBUG):
+                bytecode_log.debug(
+                    format_bytecode(prefix, name, filename, line_no, code)
+                )
+
         log.debug(
             "torchdynamo start compiling %s %s:%s, stack (elided %s frames):\n%s",
             code.co_name,
@@ -1016,6 +1020,57 @@ def _compile(
             # to upload for graph break though, because this can prevent
             # extra graph break compilations.)
             put_code_state()
+
+
+            # RAYJIT
+            if hasattr(tracer, "is_pipeline_stage") and tracer.is_pipeline_stage:
+                dynamo_tls.compiling_pipeline = True
+
+            # if the new code is the result of a pipeline partition, modify the code:
+            # instead of calling into the next pipeline stage, return the args required by the next stage
+            # TODO: currently only returning the last required arg (works for pipelines that pass only one arg)
+            if dynamo_tls.compiling_pipeline and guarded_code:
+                original_code = guarded_code.code
+                original_bytecode = list(original_code.co_code)
+                new_bytecode = []
+                remove_call = False
+                for instr in dis.Bytecode(original_code):
+                    if isinstance(instr.argval, str) and "__resume" in instr.argval:
+                        remove_call = True
+                        continue
+                    if remove_call and instr.opname == "CALL_FUNCTION":
+                        continue
+                    new_bytecode.extend(original_bytecode[instr.offset : instr.offset + 2])
+                new_code = types.CodeType(
+                    original_code.co_argcount,
+                    original_code.co_posonlyargcount,
+                    original_code.co_kwonlyargcount,
+                    original_code.co_nlocals,
+                    original_code.co_stacksize,
+                    original_code.co_flags,
+                    bytes(new_bytecode),
+                    original_code.co_consts,
+                    original_code.co_names,
+                    original_code.co_varnames,
+                    original_code.co_filename,
+                    original_code.co_name,
+                    original_code.co_firstlineno,
+                    original_code.co_lnotab,
+                    original_code.co_freevars,
+                    original_code.co_cellvars
+                )
+
+                log_bytecode(
+                    "MODIFIED STAGE BYTECODE",
+                    code.co_name,
+                    code.co_filename,
+                    code.co_firstlineno,
+                    new_code,
+                )
+                
+                # generate ray code for this pipeline stage
+                stage = generate_stage_and_ray_actor(dynamo_tls.current_module, new_code)
+                dynamo_tls.current_stages.append(stage)
 
             return guarded_code
         except Exception as e:

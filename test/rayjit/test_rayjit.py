@@ -4,6 +4,9 @@ import time
 
 print(torch.__path__)
 
+def partition(*args):
+    pass
+
 # HINT: top level module
 class SimpleNN(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -15,14 +18,15 @@ class SimpleNN(nn.Module):
     
     def forward(self, x):
         x = self.fc1(x)
-        _ = "partition"
+        partition(x)
         x = self.fc2(x)
-        _ = "partition"
+        partition(x)
         x = self.fc3(x)
         return x
 
 
 input_size, hidden_size, output_size = 10, 5, 1
+torch.manual_seed(0)
 x_train = torch.randn(10, input_size)
 y_train = torch.randn(10, output_size)
 
@@ -35,8 +39,9 @@ compiled = torch.compile(model)
 out1 = model(x_train)
 out2 = compiled(x_train)
 assert torch.all(torch.eq(out1, out2))
-print("tensors are equal!")
 
+print("original torch: ", out1)
+print("compiled torch: ", out2)
 
 # training loop
 

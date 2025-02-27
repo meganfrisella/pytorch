@@ -374,6 +374,7 @@ class DynamoTLS(threading.local):
     # temporal order.
     traced_frame_infos: list[str] = []
     # RAYJIT
+    compiling_pipeline: bool = False
     current_module: Optional[torch.nn.Module] = None
     current_stages: list[torch.nn.Module] = []
 
@@ -585,12 +586,13 @@ class _TorchDynamoContext:
                     raise e.remove_dynamo_frames() from None  # see TORCHDYNAMO_VERBOSE=1
                 finally:
                     # RAYJIT
-                    print(f"Finished compiling top-level module {fn.__class__.__name__}")
-                    # set_trace()
-                    out_path = generate_schedule(
-                        dynamo_tls.current_module.__class__.__name__, 
-                        dynamo_tls.current_stages)
-                    exec(open(out_path).read(), {"compiled": dynamo_tls.current_module})
+                    print(f"Finished compiling top-level module")
+                    if dynamo_tls.compiling_pipeline:
+                        out_path = generate_schedule(
+                            dynamo_tls.current_module.__class__.__name__, 
+                            dynamo_tls.current_stages)
+                        exec(open(out_path).read(), {"compiled": dynamo_tls.current_module})
+                        dynamo_tls.compiling_pipeline = False
 
                     # Restore the dynamic layer stack depth if necessary.
                     set_eval_frame(None)

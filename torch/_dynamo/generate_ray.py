@@ -21,18 +21,25 @@ def generate_stage_and_ray_actor(mod: torch.nn.Module, code: types.CodeType):
   fwd_name = code.co_name
   fwd_args = list(code.co_varnames[1:code.co_argcount])
   fwd_args = ", ".join(fwd_args)
-
   stage_name = f"{mod_name}_{fwd_name}_Stage"
+
+  # turn the code object into a callable function
+  callable_code = types.FunctionType(code, {})
 
   # the stage has all the attributes of the top level module (for now)
   # TODO: the new module should only get attributes necessary for this stage
   attrs = {}
   for name, val in mod.__dict__.items():
-    if not callable(val) and not name.startswith("__"):
+    if (not callable(val) and 
+        not name.startswith("__") and
+        not name == "_modules"):
       attrs[name] = val
+  
+  for name, val in mod.__dict__["_modules"].items():
+    attrs[name] = val
 
   # additional attributes
-  attrs[fwd_name] = code
+  attrs[fwd_name] = callable_code
   attrs["fwd_name"] = fwd_name
   attrs["name"] = stage_name
 
@@ -54,6 +61,7 @@ def generate_stage_and_ray_actor(mod: torch.nn.Module, code: types.CodeType):
   # create a ray actor that wraps the new stage
   ray_code = f"""
 import ray.dag
+import torch
 
 @ray.remote
 class {stage_name}_Actor:
@@ -76,19 +84,29 @@ def generate_schedule(mod_name: str, stages: list[torch.nn.Module]):
   out_path = top_level_path.parent / f"{mod_name}_ray.py"
 
   num_stages = len(stages)
-  assert(num_stages == 2) # only handles 2-stage pipelines for now
+  assert(num_stages == 3) # only handles 3-stage pipelines for now
 
   ray_code = [f"actor_{stage.name} = {stage.name}_Actor.remote()" for stage in stages]
 
   stage_1 = stages[0]
   stage_2 = stages[1]
+  stage_3 = stages[2]
 
   ray_code.append(f"""\n
 with ray.dag.InputNode() as inp:
    dag = actor_{stage_1.name}.{stage_1.fwd_name}.bind(inp)
-   dag = actor_{stage_2.name}.{stage_2.fwd_name}.bind(inp)
+   dag = actor_{stage_2.name}.{stage_2.fwd_name}.bind(dag)
+   dag = actor_{stage_3.name}.{stage_3.fwd_name}.bind(dag)
+   # TODO: dag = actor3.backward.bind(dag)
    # TODO: dag = actor2.backward.bind(dag)
    # TODO: dag = actor1.backward.bind(dag)
+
+dag = dag.experimental_compile()
+batch_size, input_size = 10, 10
+torch.manual_seed(0)
+x = torch.randn(batch_size, input_size)
+out = dag.execute(x)
+print("compiled ray: ", out.get())
 """)
 
   ray_code = '\n'.join(ray_code)

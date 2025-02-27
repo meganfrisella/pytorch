@@ -1008,15 +1008,17 @@ class InstructionTranslatorBase(
         if inst.starts_line:
             self.starts_line(inst.starts_line)
 
+        # RAYJIT
+        # from IPython.core.debugger import set_trace; set_trace()
+        if inst.argval == "partition":
+            return self.partition_graph_break(inst)
+
         if (
             not self.stack
             and self.should_compile_partial_graph()
             and self.is_non_empty_graph()
         ):
             self.current_speculation = self.speculate()
-            # RAYJIT
-            if self.current_speculation.inst.argval == "partition":
-                return self.partition_graph_break(inst)
             if self.current_speculation.failed:
                 return self.step_graph_break(inst)
 
@@ -1118,6 +1120,10 @@ class InstructionTranslatorBase(
         with self.run_ctx_mgr():
             try:
                 self.output.push_tx(self)
+                # RAYJIT
+                if self.is_pipeline_stage and not self.has_partition():
+                    self.add_unmodified_instructions()
+                    return
                 while self.step():
                     pass
             except TensorifyScalarRestartAnalysis:
@@ -1949,20 +1955,47 @@ class InstructionTranslatorBase(
     # RAYJIT
     def partition_graph_break(self, inst):
         log_graph_break(self.code_options, reason="PARTITION-caused graph break")
-        if not self.should_compile_partial_graph():
-            unimplemented("should_compile_partial_graph=False")
-        self.output.compile_subgraph(
-            self, 
-            partial_convert=True,
-            reason=GraphCompileReason("partition", [self.frame_summary()]),
+        # if not self.should_compile_partial_graph():
+        #     unimplemented("should_compile_partial_graph=False")
+        # self.output.compile_subgraph(
+        #     self,
+        #     partial_convert=True,
+        #     reason=GraphCompileReason("partition", [self.frame_summary()]),
+        # )
+
+        self.is_pipeline_stage = True
+
+        # remove the partition hint
+        self.instruction_pointer -= 1
+        self.instructions = list(
+            filter(lambda i: i.starts_line != inst.starts_line, self.instructions)
         )
-        # skip the hint `_ = "partition"`
-        self.instruction_pointer += 1
-        # create a return-resume after the hint. 
-        # TODO: return args needed by next stage but do not call directly into next stage
+
+        # move the instruction pointer past the partition hint
+        # while self.instructions[self.instruction_pointer].starts_line == inst.starts_line:
+        #     self.instruction_pointer += 1
+
+        # create a return-resume after the hint
+        self.output.add_output_instructions(
+            self.instructions[: self.instruction_pointer]
+        )
         self.output.add_output_instructions(
             self.create_call_resume_at(self.instructions[self.instruction_pointer])
         )
+
+    def has_partition(self) -> bool:
+        first = self.instructions[0]
+        assert(first.opname == "JUMP_ABSOLUTE")
+        offset = first.argval
+        for inst in self.instructions:
+            if inst.offset < offset:
+                continue
+            if inst.argval == "partition":
+                return True
+        return False
+
+    def add_unmodified_instructions(self):
+        self.output.add_output_instructions(self.instructions)
 
     def DELETE_ATTR(self, inst):
         obj = self.pop()
@@ -2736,10 +2769,14 @@ class InstructionTranslatorBase(
         distributed_state: Optional[DistributedState],
         # This determines whether to use the execution recorder.
         closure: Optional[tuple[types.CellType]] = None,
+        is_pipeline_stage=False,
     ) -> None:
         super().__init__()
         self.speculation_log = speculation_log
         self.distributed_state = distributed_state
+
+        # RAYJIT
+        self.is_pipeline_stage = is_pipeline_stage
 
         # Mutable state checkpointed by copy_graphstate()
         self.output = output
@@ -2761,9 +2798,9 @@ class InstructionTranslatorBase(
         # Properties of the input/output code
         self.instructions: list[Instruction] = instructions
         self.indexof: dict[Instruction, int] = get_indexof(self.instructions)
-        self.f_locals: dict[
-            str, Any
-        ] = f_locals  # needed for recording accessed locals for replay
+        self.f_locals: dict[str, Any] = (
+            f_locals  # needed for recording accessed locals for replay
+        )
         self.f_globals: dict[str, Any] = f_globals
         self.f_builtins: dict[str, Any] = f_builtins
         self.code_options: dict[str, Any] = code_options
@@ -2841,6 +2878,7 @@ class InstructionTranslator(InstructionTranslatorBase):
         frame_state,
         speculation_log: SpeculationLog,
         distributed_state: Optional[DistributedState],
+        is_pipeline_stage=False,
     ) -> None:
         _step_logger()(
             logging.INFO,
@@ -2874,6 +2912,7 @@ class InstructionTranslator(InstructionTranslatorBase):
             inline_depth=0,
             speculation_log=speculation_log,
             distributed_state=distributed_state,
+            is_pipeline_stage=is_pipeline_stage,
         )
 
         self._throw_if_in_functorch()

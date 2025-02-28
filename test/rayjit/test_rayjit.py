@@ -15,6 +15,7 @@ class SimpleNN(nn.Module):
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
         self.fc3 = nn.Linear(hidden_size, output_size)
+        self.loss = nn.MSELoss()
     
     def forward(self, x):
         x = self.fc1(x)
@@ -33,15 +34,22 @@ y_train = torch.randn(10, output_size)
 model = SimpleNN(input_size, hidden_size, output_size)
 compiled = torch.compile(model)
 
+criterion = nn.MSELoss()
 
 # check equivalence between original and compiled model
 
+x_train.requires_grad_()
 out1 = model(x_train)
 out2 = compiled(x_train)
 assert torch.all(torch.eq(out1, out2))
 
-print("original torch: ", out1)
-print("compiled torch: ", out2)
+# print("original torch: ", out1)
+# print("compiled torch: ", out2)
+
+loss = criterion(out1, y_train)
+loss.backward()
+
+print("torch x gradient: ", x_train.grad)
 
 # training loop
 

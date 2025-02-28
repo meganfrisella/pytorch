@@ -1122,6 +1122,7 @@ class InstructionTranslatorBase(
                 self.output.push_tx(self)
                 # RAYJIT
                 if self.is_pipeline_stage and not self.has_partition():
+                    self.is_last_pipeline_stage = True
                     self.add_unmodified_instructions()
                     return
                 while self.step():

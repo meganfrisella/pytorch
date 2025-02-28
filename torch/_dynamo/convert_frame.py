@@ -1025,6 +1025,11 @@ def _compile(
             # RAYJIT
             if hasattr(tracer, "is_pipeline_stage") and tracer.is_pipeline_stage:
                 dynamo_tls.compiling_pipeline = True
+                dynamo_tls.cur_stage += 1
+
+            is_last_pipeline_stage = False
+            if hasattr(tracer, "is_last_pipeline_stage") and tracer.is_last_pipeline_stage:
+                is_last_pipeline_stage = True
 
             # if the new code is the result of a pipeline partition, modify the code:
             # instead of calling into the next pipeline stage, return the args required by the next stage
@@ -1069,7 +1074,11 @@ def _compile(
                 )
                 
                 # generate ray code for this pipeline stage
-                stage = generate_stage_and_ray_actor(dynamo_tls.current_module, new_code)
+                stage = generate_stage_and_ray_actor(
+                    dynamo_tls.current_module, 
+                    dynamo_tls.cur_stage, 
+                    is_last_pipeline_stage, 
+                    new_code)
                 dynamo_tls.current_stages.append(stage)
 
             return guarded_code

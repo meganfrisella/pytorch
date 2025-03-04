@@ -9,7 +9,7 @@ top_level_path = Path(sys.argv[0]).resolve()
 
 
 def generate_stage_and_ray_actor(
-    mod: torch.nn.Module, stage_num: int, last_stage: bool, code: types.CodeType
+    mod: torch.nn.Module, stage_num: int, last_stage: bool, frame_attrs: list[str], code: types.CodeType
 ):
 
     ## GENERATE STAGE
@@ -32,15 +32,20 @@ def generate_stage_and_ray_actor(
     # turn the code object into a callable function
     callable_code = types.FunctionType(code, {})
 
-    # the stage has all the attributes of the top level module (for now)
-    # TODO: the new module should only get attributes necessary for this stage
+    # all attrs of the top-level module that are accessed by this stage
     attrs = {}
-    for name, val in mod.__dict__.items():
-        if not callable(val) and not name.startswith("__") and not name == "_modules":
-            attrs[name] = val
-
-    for name, val in mod.__dict__["_modules"].items():
-        attrs[name] = val
+    for attr in frame_attrs:
+        if hasattr(mod.__dict__, attr):
+            attrs[attr] = mod.__dict__[attr]
+        elif attr in mod.__dict__["_modules"]:
+            attrs[attr] = mod.__dict__["_modules"][attr]
+        else:
+            assert False and "Can't find attribute in module!"
+    
+    # final stage needs loss function
+    # ASSUMPTION: the top-level module has a 'loss' attribute which is a valid loss function
+    if last_stage: 
+        attrs["loss"] = mod.__dict__["_modules"]["loss"]
 
     # additional attributes
     attrs[fwd_name] = callable_code

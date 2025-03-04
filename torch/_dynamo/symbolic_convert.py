@@ -153,6 +153,12 @@ def _import_module(name: str) -> types.ModuleType:
     """
     return importlib.import_module(name)
 
+# RAYJIT
+@dataclasses.dataclass
+class RayTracingMeta:
+    is_pipeline_stage: bool = False
+    is_last_pipeline_stage: bool = False
+    attrs: list = dataclasses.field(default_factory=list)
 
 @dataclasses.dataclass
 class SpeculationEntry:
@@ -1010,8 +1016,15 @@ class InstructionTranslatorBase(
 
         # RAYJIT
         # from IPython.core.debugger import set_trace; set_trace()
+        # partition the frame at a partition hint
+        # TODO: not very robust
         if inst.argval == "partition":
             return self.partition_graph_break(inst)
+        
+        # track all the attributes accessed by this frame
+        if inst.argval == "self":
+            next_inst = self.instructions[self.instruction_pointer]
+            self.ray_tracing_meta.attrs.append(next_inst.argval)
 
         if (
             not self.stack
@@ -1120,11 +1133,6 @@ class InstructionTranslatorBase(
         with self.run_ctx_mgr():
             try:
                 self.output.push_tx(self)
-                # RAYJIT
-                if self.is_pipeline_stage and not self.has_partition():
-                    self.is_last_pipeline_stage = True
-                    self.add_unmodified_instructions()
-                    return
                 while self.step():
                     pass
             except TensorifyScalarRestartAnalysis:
@@ -1964,7 +1972,8 @@ class InstructionTranslatorBase(
         #     reason=GraphCompileReason("partition", [self.frame_summary()]),
         # )
 
-        self.is_pipeline_stage = True
+        self.ray_tracing_meta.is_pipeline_stage = True
+        self.ray_tracing_meta.is_last_pipeline_stage = False
 
         # remove the partition hint
         self.instruction_pointer -= 1
@@ -1985,8 +1994,11 @@ class InstructionTranslatorBase(
         )
 
     def has_partition(self) -> bool:
+        # called to check if this frame represents the last stage of a pipeline partition
+        # must only be called on frames produced by a prior partition, so the frame starts with a jump
         first = self.instructions[0]
-        assert(first.opname == "JUMP_ABSOLUTE")
+        assert first.opname == "JUMP_ABSOLUTE"
+
         offset = first.argval
         for inst in self.instructions:
             if inst.offset < offset:
@@ -2777,7 +2789,7 @@ class InstructionTranslatorBase(
         self.distributed_state = distributed_state
 
         # RAYJIT
-        self.is_pipeline_stage = is_pipeline_stage
+        self.ray_tracing_meta = RayTracingMeta(is_pipeline_stage=is_pipeline_stage, is_last_pipeline_stage=True)
 
         # Mutable state checkpointed by copy_graphstate()
         self.output = output
@@ -3222,6 +3234,14 @@ class InstructionTranslator(InstructionTranslatorBase):
             logging.INFO,
             f"torchdynamo done tracing {self.f_code.co_name} ({inst.opname})",
         )
+
+        # RAYJIT
+        # do not graph compile if returning from a pipeline stage
+        # TODO: can't call compiled code from Ray actors
+        if self.ray_tracing_meta.is_pipeline_stage and self.ray_tracing_meta.is_last_pipeline_stage:
+            self.output.add_output_instructions(self.instructions)
+            return ReturnValueOp
+
         log.debug("%s triggered compile", inst.opname)
         self.output.compile_subgraph(
             self,

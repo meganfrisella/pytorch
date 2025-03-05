@@ -11,7 +11,6 @@ top_level_path = Path(sys.argv[0]).resolve()
 def generate_stage_and_ray_actor(
     mod: torch.nn.Module, stage_num: int, last_stage: bool, frame_attrs: list[str], code: types.CodeType
 ):
-
     ## GENERATE STAGE
 
     # get the name/args of the top level module
@@ -76,28 +75,41 @@ import torch
 class {stage_name}_Actor:
   def __init__(self):
     self.model = compiled.{stage_name}
-  
-  def {fwd_name}(self, {fwd_args}):
+"""
+
+    if last_stage:
+        fwd_code = f"""
+  def forward(self, {fwd_args}):
     # TODO: what is the activation if there is more than one argument? 
     {fwd_args}.requires_grad_()
     self.prev_activation = {fwd_args}
     self.pred = self.model.{fwd_name}({fwd_args})
     return self.pred
 """
-
+    else:
+        fwd_code = f"""
+  def forward(self, {fwd_args}):
+    # TODO: what is the activation if there is more than one argument? 
+    {fwd_args}.requires_grad_()
+    self.prev_activation = {fwd_args}
+    self.pred = self.model.{fwd_name}({fwd_args})
+    return self.pred.clone().detach()
+"""
+        
     if last_stage:
       bwd_code = f"""
-  def {bwd_name}(self, pred, truth):
+  def backward(self, pred, truth):
     loss = self.model.loss(pred, truth)
     loss.backward()
     return self.prev_activation.grad
 """
     else:
       bwd_code = f"""
-  def {bwd_name}(self, grad):
+  def backward(self, grad):
     self.pred.backward(grad)
     return self.prev_activation.grad
 """
+    ray_code += fwd_code
     ray_code += bwd_code
 
     # append the actor to the output file
@@ -111,31 +123,28 @@ def generate_schedule(mod_name: str, stages: list[torch.nn.Module]):
     out_path = top_level_path.parent / f"{mod_name}_ray.py"
 
     num_stages = len(stages)
-    assert num_stages == 3 and "only handles 3-stage pipelines for now"
 
-    ray_code = [f"{stage.name}_actor = {stage.name}_Actor.remote()" for stage in stages]
-
-    stage_1 = stages[0]
-    stage_2 = stages[1]
-    stage_3 = stages[2]
+    ray_code = ["\n"]
+    ray_code.extend([f"{stage.name}_actor = {stage.name}_Actor.remote()" for stage in stages])
+    actor_names = ", ".join([f"{stage.name}_actor" for stage in stages])
+    ray_code.append(f"workers = [{actor_names}]")
 
     ray_code.append(
-        f"""\n
-with ray.dag.InputNode() as inp:
-   dag = {stage_1.name}_actor.{stage_1.fwd_name}.bind(inp[0])
-   dag = {stage_2.name}_actor.{stage_2.fwd_name}.bind(dag)
-   dag = {stage_3.name}_actor.{stage_3.fwd_name}.bind(dag)
-   dag = {stage_3.name}_actor.{stage_3.bwd_name}.bind(dag, inp[1])
-   dag = {stage_2.name}_actor.{stage_2.bwd_name}.bind(dag)
-   dag = {stage_1.name}_actor.{stage_1.bwd_name}.bind(dag)
-
+        f"""
+import scheduling
+dag = scheduling.gpipe(workers, num_microbatches=4)
 dag = dag.experimental_compile()
-batch_size, input_size, output_size = 10, 10, 1
+
+#scheduling.execute_dag(dag, num_microbatches=4)
+
+batch_size, input_size, output_size = 12, 10, 1
 torch.manual_seed(0)
 x = torch.randn(batch_size, input_size)
 y = torch.randn(batch_size, output_size)
 out = dag.execute(x, y)
-print("ray x gradient: ", out.get())
+
+print("ray x gradient:")
+print(ray.get(out))
 """
     )
 

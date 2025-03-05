@@ -375,6 +375,7 @@ class DynamoTLS(threading.local):
     traced_frame_infos: list[str] = []
     # RAYJIT
     compiling_pipeline: bool = False
+    finished_processing_stages: bool = False
     cur_stage: int = 0
     current_module: Optional[torch.nn.Module] = None
     current_stages: list[torch.nn.Module] = []

@@ -1036,12 +1036,11 @@ def _compile(
             if is_pipeline_stage:
                 dynamo_tls.compiling_pipeline = True
                 dynamo_tls.cur_stage += 1
-            
 
             # if the new code is the result of a pipeline partition, modify the code:
             # instead of calling into the next pipeline stage, return the args required by the next stage
             # TODO: currently only returning the last required arg (works for pipelines that pass only one arg)
-            if is_pipeline_stage and guarded_code:
+            if is_pipeline_stage and not dynamo_tls.finished_processing_stages and guarded_code:
                 original_code = guarded_code.code
                 original_bytecode = list(original_code.co_code)
                 new_bytecode = []
@@ -1088,6 +1087,9 @@ def _compile(
                     attrs,
                     new_code)
                 dynamo_tls.current_stages.append(stage)
+                
+                if is_last_pipeline_stage:
+                    dynamo_tls.finished_processing_stages = True
 
             return guarded_code
         except Exception as e:

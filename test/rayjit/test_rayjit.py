@@ -25,11 +25,10 @@ class SimpleNN(nn.Module):
         x = self.fc3(x)
         return x
 
-
-input_size, hidden_size, output_size = 10, 5, 1
+batch_size, input_size, hidden_size, output_size = 12, 10, 5, 1
 torch.manual_seed(0)
-x_train = torch.randn(10, input_size)
-y_train = torch.randn(10, output_size)
+x_train = torch.randn(batch_size, input_size)
+y_train = torch.randn(batch_size, output_size)
 
 model = SimpleNN(input_size, hidden_size, output_size)
 compiled = torch.compile(model)
@@ -43,24 +42,8 @@ out1 = model(x_train)
 out2 = compiled(x_train)
 assert torch.all(torch.eq(out1, out2))
 
-# print("original torch: ", out1)
-# print("compiled torch: ", out2)
-
 loss = criterion(out1, y_train)
 loss.backward()
 
-print("torch x gradient: ", x_train.grad)
-
-# training loop
-
-"""
-criterion = nn.MSELoss()
-optimizer = optim.SGD(model.parameters(), lr=0.01)
-
-for epoch in range(1000):
-    outputs = compiled.forward(x_train)
-    loss = criterion(outputs, y_train)
-    loss.backward()
-    optimizer.step()
-    optimizer.zero_grad()
-"""
+print("torch x gradient:")
+print(x_train.grad)

@@ -100,15 +100,23 @@ class {stage_name}_Actor:
       bwd_code = f"""
   def backward(self, pred, truth):
     loss = self.model.loss(pred, truth)
-    loss.backward()
+    loss.backward(retain_graph=True)
+    return self.prev_activation.grad
+"""
+    elif stage_num == 1:
+      bwd_code = f"""
+  def backward(self, grad):
+    self.pred.backward(grad, retain_graph=True)
+    #print(self.prev_activation.grad)
     return self.prev_activation.grad
 """
     else:
       bwd_code = f"""
   def backward(self, grad):
-    self.pred.backward(grad)
+    self.pred.backward(grad, retain_graph=True)
     return self.prev_activation.grad
 """
+
     ray_code += fwd_code
     ray_code += bwd_code
 
@@ -132,19 +140,16 @@ def generate_schedule(mod_name: str, stages: list[torch.nn.Module]):
     ray_code.append(
         f"""
 import scheduling
-dag = scheduling.gpipe(workers, num_microbatches=4)
-dag = dag.experimental_compile()
+dag = scheduling.build_gpipe_dag(workers)
 
-#scheduling.execute_dag(dag, num_microbatches=4)
+#dag.visualize()
 
-batch_size, input_size, output_size = 12, 10, 1
 torch.manual_seed(0)
+batch_size, input_size, output_size = 12, 10, 1
 x = torch.randn(batch_size, input_size)
 y = torch.randn(batch_size, output_size)
-out = dag.execute(x, y)
 
-print("ray x gradient:")
-print(ray.get(out))
+scheduling.execute_dag(dag, x, y, batch_size)
 """
     )
 

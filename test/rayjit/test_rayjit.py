@@ -7,8 +7,8 @@ print(torch.__path__)
 def partition(*args):
     pass
 
-# HINT: top level module
 class SimpleNN(nn.Module):
+    # TODO: torch deferred initialization
     def __init__(self, input_size, hidden_size, output_size):
         super(SimpleNN, self).__init__()
         self.hints = []
@@ -45,5 +45,5 @@ assert torch.all(torch.eq(out1, out2))
 loss = criterion(out1, y_train)
 loss.backward()
 
-print("torch x gradient:")
-print(x_train.grad)
+# print("torch x gradient:")
+# print(x_train.grad)

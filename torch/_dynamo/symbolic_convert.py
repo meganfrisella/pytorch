@@ -1084,6 +1084,7 @@ class InstructionTranslatorBase(
     exec_recorder: Optional[ExecutionRecorder]
     strict_checks_fn: Optional[Callable[[VariableTracker], bool]]
     start_point: Optional[int]
+    distribute: bool = False
 
     def mark_inconsistent_side_effects(self):
         """
@@ -1315,7 +1316,10 @@ class InstructionTranslatorBase(
 
     @property
     def next_instruction(self):
+        # try:
         return self.instructions[self.instruction_pointer]  # type: ignore[index]
+        # except:
+        #     return None
 
     def step_graph_break(self, continue_inst):
         # generate code from checkpoint
@@ -3214,6 +3218,7 @@ class InstructionTranslatorBase(
         distributed_state: Optional[DistributedState],
         # This determines whether to use the execution recorder.
         closure: Optional[tuple[types.CellType]] = None,
+        distribute: bool = False,
     ) -> None:
         super().__init__()
         self.speculation_log = speculation_log
@@ -3247,6 +3252,7 @@ class InstructionTranslatorBase(
         self.f_builtins: dict[str, Any] = f_builtins
         self.code_options: dict[str, Any] = code_options
         self.f_code: types.CodeType = f_code
+        self.distribute: bool = distribute
 
         # Execution record for replaying errors
         if closure is not None and config.replay_record_enabled:
@@ -3328,6 +3334,7 @@ class InstructionTranslator(InstructionTranslatorBase):
         speculation_log: SpeculationLog,
         exn_vt_stack: ExceptionStack,
         distributed_state: Optional[DistributedState],
+        distribute: bool = False,
     ) -> None:
         _step_logger()(
             logging.INFO,
@@ -3345,6 +3352,7 @@ class InstructionTranslator(InstructionTranslatorBase):
                 global_scope=f_globals,
                 f_code=f_code,
                 torch_function_mode_stack=torch_function_mode_stack,
+                distribute=distribute,
             ),
             instructions=instructions,
             f_locals=f_locals,
@@ -3362,7 +3370,10 @@ class InstructionTranslator(InstructionTranslatorBase):
             speculation_log=speculation_log,
             exn_vt_stack=exn_vt_stack,
             distributed_state=distributed_state,
+            distribute=distribute,
         )
+
+        
 
         self._throw_if_in_functorch()
 

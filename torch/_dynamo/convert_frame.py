@@ -90,6 +90,7 @@ from .cache_size import (
 from .eval_frame import (
     always_optimize_code_objects,
     dynamo_tls,
+    DistributedCompilationInfo,
     skip_code,
     TorchPatcher,
 )
@@ -476,6 +477,7 @@ class ConvertFrameAssert:
         one_graph: bool = True,
         export: bool = False,
         export_constraints: Optional[typing.Never] = None,
+        distribute: bool = False,
     ) -> None:
         # assert export_constraints is None
         reset_graph_break_dup_checker()
@@ -483,6 +485,7 @@ class ConvertFrameAssert:
         self._one_graph = one_graph
         self._export = export
         self._export_constraints = export_constraints
+        self._distribute = distribute
 
     @property
     def _clone_with_backend(self) -> Callable[[CompilerFn], ConvertFrameAssert]:
@@ -491,6 +494,7 @@ class ConvertFrameAssert:
             self._one_graph,
             self._export,
             self._export_constraints,
+            self._distribute,
         )
 
     def __call__(
@@ -615,10 +619,25 @@ class ConvertFrameAssert:
             },
         )
 
+        print(f"Attempting to convert frame {code.co_name} compile_id: {compile_id}")
+
         # Record traced frames, skipping Dynamo generated ones.
         if not code.co_name.startswith(TORCH_DYNAMO_RESUME_IN_PREFIX):
             info = f"{code.co_name} {code.co_filename}:{code.co_firstlineno}"
             dynamo_tls.traced_frame_infos.append(info)
+        
+        # Track the graphs generated for a forward call (across graph breaks)
+        # Not yet used to make placement / scheduling decisions
+        if code.co_name == "forward":
+            fwd_name = f"{code.co_filename}:{code.co_firstlineno}"
+            print(f"Start compiling {fwd_name}")
+            dynamo_tls.currently_compiling = fwd_name
+            if fwd_name in dynamo_tls.distributed_compilation_infos:
+                print(f"Previous compilation has {dynamo_tls.distributed_compilation_infos[fwd_name].num_graphs()} graphs")
+                dynamo_tls.distributed_compilation_infos[fwd_name].reset()
+            else:
+                print("No previous compilation")
+                dynamo_tls.distributed_compilation_infos[fwd_name] = DistributedCompilationInfo()
 
         with compile_context(CompileContext(compile_id)):
             return _compile(
@@ -638,6 +657,7 @@ class ConvertFrameAssert:
                 frame_state=frame_state,
                 compile_id=compile_id,
                 skip=skip + 1,
+                distribute=self._distribute,
             )
 
 
@@ -646,9 +666,10 @@ def convert_frame_assert(
     one_graph: bool = True,
     export: bool = False,
     export_constraints: Optional[typing.Never] = None,
+    distribute: bool = False
 ) -> ConvertFrameAssert:
     """Fully convert a frame into an FX graph"""
-    return ConvertFrameAssert(compiler_fn, one_graph, export, export_constraints)
+    return ConvertFrameAssert(compiler_fn, one_graph, export, export_constraints, distribute)
 
 
 from collections import OrderedDict
@@ -691,6 +712,7 @@ def _compile(
     *,
     compile_id: CompileId,
     skip: int = 0,
+    distribute: bool = False,
 ) -> ConvertFrameReturn:
     from torch.fx.experimental.validator import (
         bisect,
@@ -734,6 +756,7 @@ def _compile(
             speculation_log=speculation_log,
             exn_vt_stack=exn_vt_stack,
             distributed_state=distributed_state,
+            distribute=distribute,
         )
 
         try:
@@ -948,6 +971,15 @@ def _compile(
             # variables which can trigger TorchDynamo on the children frames but
             # they are benign and do not generate any new graphs.
             hooks.guard_export_fn(output.guards)
+
+        # Track graphs generated for a forward call (across graph breaks)
+        # Not yet used to make placement / scheduling decisions
+        fwd_name = dynamo_tls.currently_compiling
+        if fwd_name:
+            dynamo_tls.distributed_compilation_infos[fwd_name].add_graph(output)
+            if "__resume_at_" not in dis.Bytecode(out_code).dis():
+                print(f"Finished compiling {fwd_name}, traced {dynamo_tls.distributed_compilation_infos[fwd_name].num_graphs()} graphs")
+                dynamo_tls.currently_compiling = None
 
         return wrap_guarded_code(guarded_code)
 
@@ -1219,10 +1251,12 @@ class ConvertFrame:
         self,
         compiler_fn: CompilerFn,
         hooks: Hooks,
+        distribute: bool,
     ) -> None:
         self._torchdynamo_orig_callable = compiler_fn
-        self._inner_convert = convert_frame_assert(compiler_fn, one_graph=False)
+        self._inner_convert = convert_frame_assert(compiler_fn, one_graph=False, distribute=distribute)
         self._hooks = hooks
+        self._distribute = distribute
 
     @property
     def _clone_with_backend(self) -> Callable[[WrapBackendDebug], ConvertFrame]:
@@ -1236,6 +1270,7 @@ class ConvertFrame:
         frame_state: dict[str, Union[int, FrameStateSizeEntry]],
         skip: int = 0,
     ) -> ConvertFrameReturn:
+
         input_codes.add(frame.f_code)
         counters["frames"]["total"] += 1
         try:
@@ -1324,9 +1359,9 @@ class ConvertFrame:
         return ConvertFrameReturn()
 
 
-def convert_frame(compiler_fn: CompilerFn, hooks: Hooks) -> ConvertFrame:
+def convert_frame(compiler_fn: CompilerFn, hooks: Hooks, distribute: bool) -> ConvertFrame:
     """Try to convert a frame into an FX graph, if error leave frame unmodified"""
-    return ConvertFrame(compiler_fn, hooks)
+    return ConvertFrame(compiler_fn, hooks, distribute)
 
 
 # TODO mlazos: add support for same args, or record them
@@ -1356,6 +1391,7 @@ def replay(filename: str) -> None:
             frame=None,
             frame_state={},
             compile_id=CompileId(frame_id=42, frame_compile_id=999),
+            distribute=False,
         )
     finally:
         config.replay_record_enabled = original_replay_val
@@ -1383,10 +1419,11 @@ class ConvertFrameProtocol(typing.Protocol):
 
 
 class CatchErrorsWrapper:
-    def __init__(self, callback: ConvertFrameProtocol, hooks: Hooks) -> None:
+    def __init__(self, callback: ConvertFrameProtocol, hooks: Hooks, distribute: bool) -> None:
         functools.wraps(callback)(self)
         self._torchdynamo_orig_callable = callback
         self.hooks = hooks
+        self.distribute = distribute
 
     def __call__(
         self,
@@ -1466,6 +1503,6 @@ class CatchErrorsWrapper:
 
 
 def catch_errors_wrapper(
-    callback: ConvertFrameProtocol, hooks: Hooks
+    callback: ConvertFrameProtocol, hooks: Hooks, distribute: bool,
 ) -> CatchErrorsWrapper:
-    return CatchErrorsWrapper(callback, hooks)
+    return CatchErrorsWrapper(callback, hooks, distribute)

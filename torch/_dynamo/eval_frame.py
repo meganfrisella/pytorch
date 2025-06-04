@@ -333,6 +333,7 @@ class OptimizedModule(torch.nn.Module):
         self.dynamo_ctx = dynamo_ctx
         self._initialize()
         self.training = self._orig_mod.training
+        self.ray_actors = []
 
     def _initialize(self):
         # Do this stuff in constructor to lower overhead slightly
@@ -490,6 +491,18 @@ def make_set_enable_dynamic(enable: bool):
         )
 
 
+class DistributedCompilationInfo:
+    traced_graphs = []
+
+    def num_graphs(self):
+        return len(self.traced_graphs)
+    
+    def add_graph(self, graph):
+        self.traced_graphs.append(graph)
+
+    def reset(self):
+        self.traced_graphs.clear()
+
 # A thread local storage that serves to store information as Dynamo traces
 # through a user provided function.
 class DynamoTLS(threading.local):
@@ -497,6 +510,14 @@ class DynamoTLS(threading.local):
     # temporal order.
     traced_frame_infos: list[str] = []
 
+    # Distributed compilation summary for each nn.Module that gets compiled
+    distributed_compilation_infos: Dict[str, DistributedCompilationInfo] = {}
+
+    # The name of the forward function that is currently being compiled, if any
+    currently_compiling: str = None
+
+    # The current module that is being compiled
+    current_mod : OptimizedModule = None
 
 dynamo_tls = DynamoTLS()
 
@@ -529,6 +550,7 @@ class _TorchDynamoContext:
         export=False,
         dynamic=None,
         compiler_config=None,
+        distribute=False,
     ) -> None:
         super().__init__()
         assert callable(callback) or callback is False or callback is None
@@ -541,6 +563,7 @@ class _TorchDynamoContext:
         self.compiler_config = compiler_config
         self.cleanup_fns: list[Callable[[], Any]] = []
         self.enter_exit_hooks = []
+        self.distribute = distribute
         patch_fn()
 
         # Save the backends so that we can reset them during torch._dynamo.reset
@@ -568,6 +591,8 @@ class _TorchDynamoContext:
             self.enter_exit_hooks.append(call_backend_ctx)
 
     def __enter__(self):
+        # print(f"entering a dynamo context {self.ctxt_num}")
+
         if config.raise_on_ctx_manager_usage:
             raise RuntimeError(
                 "torch._dynamo.optimize(...) is used with a context manager. "
@@ -609,6 +634,8 @@ class _TorchDynamoContext:
         if isinstance(fn, torch.nn.Module):
             mod = fn
             new_mod = OptimizedModule(mod, self)
+            dynamo_tls.current_mod = new_mod
+
             # Save the function pointer to find the original callable while nesting
             # of decorators.
             new_mod._torchdynamo_orig_callable = mod.forward
@@ -790,6 +817,7 @@ class OptimizeContext(_TorchDynamoContext):
         rebuild_ctx: Optional[
             Callable[[], Union[OptimizeContext, _NullDecorator]]
         ] = None,
+        distribute=False,
     ) -> None:
         def on_enter():
             install_generation_tagging_init()
@@ -803,6 +831,7 @@ class OptimizeContext(_TorchDynamoContext):
             export=export,
             dynamic=dynamic,
             compiler_config=compiler_config,
+            distribute=distribute,
         )
 
         if config.compiled_autograd:
@@ -918,15 +947,17 @@ def _optimize_catch_errors(
     dynamic=None,
     compiler_config=None,
     rebuild_ctx=None,
+    distribute=False,
 ):
     return OptimizeContext(
-        convert_frame.catch_errors_wrapper(compile_fn, hooks),
+        convert_frame.catch_errors_wrapper(compile_fn, hooks, distribute),
         backend_ctx_ctor=backend_ctx_ctor,
         first_ctx=True,
         export=export,
         dynamic=dynamic,
         compiler_config=compiler_config,
         rebuild_ctx=rebuild_ctx,
+        distribute=distribute,
     )
 
 
@@ -1017,6 +1048,7 @@ def _optimize(
     guard_filter_fn=None,
     disable=False,
     dynamic=None,
+    distribute=False,
 ) -> Union[OptimizeContext, _NullDecorator]:
     """
     The main entrypoint of TorchDynamo.  Do graph capture and call
@@ -1080,7 +1112,7 @@ def _optimize(
     # _optimize_catch_errors in the field _torchdynamo_orig_callable. This can
     # be used by eval_frame.c to insert a guard on the backend.
     return _optimize_catch_errors(
-        convert_frame.convert_frame(backend, hooks=hooks),
+        convert_frame.convert_frame(backend, hooks=hooks, distribute=distribute),
         hooks,
         backend_ctx_ctor,
         dynamic=dynamic,
@@ -1090,6 +1122,7 @@ def _optimize(
             else None
         ),
         rebuild_ctx=rebuild_ctx,
+        distribute=distribute,
     )
 
 
@@ -1980,6 +2013,7 @@ def _optimize_assert(
     export=False,
     export_constraints=None,
     dynamic=None,
+    distribute=False,
 ):
     """
     The same as `torch._dynamo.optimize(backend, nopython=True)`
@@ -1991,7 +2025,7 @@ def _optimize_assert(
 
     return _optimize_catch_errors(
         convert_frame.convert_frame_assert(
-            backend, export=export, export_constraints=export_constraints
+            backend, export=export, export_constraints=export_constraints, distribute=distribute,
         ),
         hooks,
         backend_ctx_ctor,

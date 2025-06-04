@@ -50,6 +50,7 @@ from torch._guards import (
     CompileId,
     GlobalContextCheckpointState,
     Source,
+    ChainedSource,
     TracingContext,
 )
 from torch._subclasses.fake_tensor import FakeTensor
@@ -101,6 +102,8 @@ from .source import (
     is_constant_source,
     is_from_local_source,
     LocalSource,
+    DictGetItemSource,
+    NNModuleSource,
     NumpyTensorSource,
     ParamBufferSource,
     ShapeEnvSource,
@@ -146,6 +149,7 @@ from .variables.tensor import (
 )
 from .variables.torch_function import TensorWithTFOverrideVariable
 
+from .eval_frame import dynamo_tls
 
 if TYPE_CHECKING:
     from torch._dynamo.symbolic_convert import InstructionTranslatorBase
@@ -306,6 +310,7 @@ class OutputGraphGuardsState:
 
     export: bool = False
     export_constraints: bool = False
+    distribute: bool = False
 
     _guards: Optional[torch._guards.GuardsSet] = None
     _aotautograd_guards: Optional[list[torch._guards.GuardEnvExpr]] = None
@@ -348,6 +353,7 @@ class OutputGraph(OutputGraphGuardsState):
         global_scope: Scope,
         f_code,
         torch_function_mode_stack,
+        distribute: bool = False,
     ):
         super().__init__(
             local_scope,
@@ -358,6 +364,7 @@ class OutputGraph(OutputGraphGuardsState):
             dual_level=torch.autograd.forward_ad._current_level,
             functorch_layers=torch._functorch.pyfunctorch.retrieve_all_functorch_interpreters(),
             current_device=torch.utils._device.CURRENT_DEVICE,
+            distribute=distribute,
         )
         self.tracers = [SubgraphTracer(self, is_export=export)]
         # Map from graph input's `Source` to its `VariableTracker` to
@@ -371,6 +378,12 @@ class OutputGraph(OutputGraphGuardsState):
         self.compile_id: int = next(_compile_id_counter)
         # Set of globals installed via install_global* APIs
         self.installed_globals: set[str] = set()
+
+        self.distribute = distribute
+        # if distributed compilation, modify fx.Graph graphargs to
+        # account for sending model parameters to distributed actors
+        if self.distribute:
+            self.override_graphargs = None
 
         # TODO: maybe should just pass the entire f_code in here?  Not
         # sure...
@@ -1608,6 +1621,11 @@ class OutputGraph(OutputGraphGuardsState):
 
             cg = PyCodegen(tx)
             cg.make_call_generated_code(name)
+
+            if self.distribute:
+                if self.override_graphargs:
+                    self.override_graphargs = None
+
             return cg.get_instructions()
 
     @property
@@ -1616,6 +1634,9 @@ class OutputGraph(OutputGraphGuardsState):
 
     @property
     def graphargs(self) -> list[GraphArg]:
+        if self.distribute:
+            if self.override_graphargs:
+                return self.override_graphargs
         return [node.meta["grapharg"] for node in self.placeholders]
 
     def call_user_compiler(self, gm: fx.GraphModule) -> CompiledFn:
@@ -1659,7 +1680,73 @@ class OutputGraph(OutputGraphGuardsState):
             compiler_fn = self.compiler_fn
             if config.verify_correctness:
                 compiler_fn = WrapperBackend(compiler_fn)
-            compiled_fn = compiler_fn(gm, self.example_inputs())
+
+            if self.distribute:
+                import ray
+                from .distribute_ray import StageActor
+
+                # serialize the fx.Graph to compile on the actor
+                torch.save(gm, "graph_module.pt")
+                with open("graph_module.pt", "rb") as f:
+                    data = f.read()
+
+                # make sure the example inputs are serializable (get concrete values from symboilc ints)
+                new_example_inputs = []
+                for ex in self.example_inputs():
+                    if isinstance(ex, torch.SymInt):
+                        new_example_inputs.append(int(ex))
+                    else:
+                        new_example_inputs.append(ex)
+                
+                # get all the graphargs that are model parameters in order and send those
+                # parameters to the actor
+                parameters = []
+                new_graphargs = []
+                orig_mod = dynamo_tls.current_mod._orig_mod
+
+                def get_param(base: Source):
+                    if isinstance(base, ChainedSource):
+                        resource = get_param(base.base)
+                        if isinstance(base, AttrSource):
+                            return getattr(resource, base.member)
+                        elif isinstance(base, DictGetItemSource):
+                            return resource[base.index]
+                        elif isinstance(base, NNModuleSource):
+                            return resource
+                        
+                    elif isinstance(base, LocalSource):
+                        assert base.local_name == "self"
+                        return orig_mod
+                    
+                    print(f"got Source type {type(base)}")
+                    assert False and "Got unexpected Source type"
+
+                for idx, arg in enumerate(self.graphargs):
+                    if "self" in str(arg):
+                        parameters.append(get_param(arg.source))
+                    else:
+                        parameters.append(None)
+                        new_graphargs.append(arg)
+                        
+                assert len(new_graphargs) == len(list(filter(lambda a: a is None, parameters)))
+                self.override_graphargs = new_graphargs
+
+                # instantiate a Ray actor and send the fx.Graph to get compiled
+                actor = StageActor.remote(self.compile_id, compiler_fn, new_example_inputs, parameters)
+                ray.get(actor.compile_graph.remote("graph_module.pt", data))
+
+                # save a reference to the actor for cleanup
+                dynamo_tls.current_mod.ray_actors.append(actor)
+
+                # patch in a Ray remote call to the compiled fx.Graph
+                def overwrite_compiled_fn(*args):
+                    out = actor.call.remote(*args)
+                    return ray.get(out)
+
+                compiled_fn = overwrite_compiled_fn
+            else:
+                compiled_fn = compiler_fn(gm, self.example_inputs())
+
             _step_logger()(logging.INFO, f"done compiler function {name}")
             assert callable(compiled_fn), "compiler_fn did not return callable"
         except (TensorifyScalarRestartAnalysis, ShortenTraceback):

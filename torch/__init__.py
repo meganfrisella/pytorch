@@ -2430,6 +2430,7 @@ def compile(
         dict[str, _Union[str, builtins.int, builtins.bool, _Callable]]
     ] = None,
     disable: builtins.bool = False,
+    distribute: bool = False,
 ) -> _Callable[_InputT, _RetT]: ...
 
 
@@ -2445,6 +2446,7 @@ def compile(
         dict[str, _Union[str, builtins.int, builtins.bool, _Callable]]
     ] = None,
     disable: builtins.bool = False,
+    distribute: bool = False,
 ) -> _Callable[[_Callable[_InputT, _RetT]], _Callable[_InputT, _RetT]]: ...
 
 
@@ -2459,6 +2461,7 @@ def compile(
         dict[str, _Union[str, builtins.int, builtins.bool, _Callable]]
     ] = None,
     disable: builtins.bool = False,
+    distribute: bool = False,
 ) -> _Union[
     _Callable[[_Callable[_InputT, _RetT]], _Callable[_InputT, _RetT]],
     _Callable[_InputT, _RetT],
@@ -2608,6 +2611,7 @@ def compile(
         dynamic=dynamic,
         disable=disable,
         guard_filter_fn=guard_filter_fn,
+        distribute=distribute,
     )(model)  # type: ignore[return-value]
 
 

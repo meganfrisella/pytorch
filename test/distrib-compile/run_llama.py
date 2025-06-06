@@ -1,13 +1,16 @@
+import ray
 import torch
 from torch import nn, optim
 from llama import Transformer, LLAMA_DEBUG, LLAMA_1B
 
-import torch._dynamo
-
 llama_config = LLAMA_DEBUG
+
+loss_fn = torch.nn.CrossEntropyLoss()
+optim_fn = optim.Adam
 
 model = Transformer(llama_config)
 compiled_model = torch.compile(model, distribute=True)
+compiled_model._set_optimizer(optim_fn)
 
 batch_size = 100
 seq_len = 32
@@ -15,17 +18,30 @@ x = torch.randint(0, llama_config.vocab_size, (batch_size, seq_len))
 y = torch.zeros((batch_size, llama_config.vocab_size), dtype=torch.long)
 
 """
-# TODO: test back propagation
+# test backprop
+optim = optim_fn(model.parameters())
+
 out1 = model(x)
 out2 = compiled_model(x)
 
-loss1 = torch.nn.CrossEntropyLoss()(out1, y)
-loss2 = torch.nn.CrossEntropyLoss()(out2, y)
+loss = loss_fn(out1, y)
+loss.backward()
+optim.step()
+optim.zero_grad()
 
-loss1.backward()
-loss2.backward()
+for idx, actor in enumerate(reversed(compiled_model.ray_actors)):
+    if idx == 0:
+        grad = actor.backward.remote(truth=y, loss_fn=loss_fn)
+    else:
+        grad = actor.backward.remote(grad=grad)
+ray.get(grad)
 
+for actor in compiled_model.ray_actors:
+    ray.get(actor.update.remote())
+
+print("original:")
 out11 = model(x)
+print("compiled:")
 out22 = compiled_model(x)
 """
 
@@ -41,7 +57,7 @@ compiled_model(x1)
 compiled_model(x2)
 compiled_model(x1)
 compiled_model(x2)
-# """
+"""
 
 # """
 # time overheads
@@ -55,7 +71,7 @@ for i in range(5):
 # timed
 
 start_compiled = time.perf_counter()
-for i in range(5):
+for i in range(10):
     compiled_model(x)
 end_compiled = time.perf_counter()
 
@@ -66,4 +82,8 @@ end_original = time.perf_counter()
 
 print(f"Compiled time: {end_compiled-start_compiled:.6f}")
 print(f"Original time: {end_original-start_original:.6f}")
+
+import time
+time.sleep(3)
+ray.timeline(filename="timeline.json")
 # """

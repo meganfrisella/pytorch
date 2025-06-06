@@ -41,11 +41,11 @@ class ModelArgs:
 
 
 LLAMA_DEBUG = ModelArgs(
-    dim=32,  # 1/2
+    dim=128,
     n_layers=2,
-    n_heads=4,
-    n_kv_heads=1,
-    vocab_size=3200,
+    n_heads=32,
+    n_kv_heads=8,
+    vocab_size=128256,
     multiple_of=256,
     ffn_dim_multiplier=1.5,
     norm_eps=1e-5,
@@ -444,5 +444,4 @@ class Transformer(nn.Module):
         h = self.norm(h) if self.norm else h
         output = self.output(h).float() if self.output else h
 
-        # print(h[0][0][0])
         return output

@@ -36,6 +36,7 @@ import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, cast, Optional, TYPE_CHECKING, Union
 
+import io
 import sympy
 
 import torch._guards
@@ -1686,9 +1687,9 @@ class OutputGraph(OutputGraphGuardsState):
                 from .distribute_ray import StageActor
 
                 # serialize the fx.Graph to compile on the actor
-                torch.save(gm, "graph_module.pt")
-                with open("graph_module.pt", "rb") as f:
-                    data = f.read()
+                buf = io.BytesIO()
+                torch.save(gm, buf)
+                buf.seek(0)
 
                 # make sure the example inputs are serializable (get concrete values from symboilc ints)
                 new_example_inputs = []
@@ -1702,7 +1703,7 @@ class OutputGraph(OutputGraphGuardsState):
                 # parameters to the actor
                 parameters = []
                 new_graphargs = []
-                orig_mod = dynamo_tls.current_mod._orig_mod
+                mod = dynamo_tls.current_mod
 
                 def get_param(base: Source):
                     if isinstance(base, ChainedSource):
@@ -1716,9 +1717,9 @@ class OutputGraph(OutputGraphGuardsState):
                         
                     elif isinstance(base, LocalSource):
                         assert base.local_name == "self"
-                        return orig_mod
+                        return mod._orig_mod
                     
-                    print(f"got Source type {type(base)}")
+                    log.warn(f"got Source type {type(base)}")
                     assert False and "Got unexpected Source type"
 
                 for idx, arg in enumerate(self.graphargs):
@@ -1732,16 +1733,34 @@ class OutputGraph(OutputGraphGuardsState):
                 self.override_graphargs = new_graphargs
 
                 # instantiate a Ray actor and send the fx.Graph to get compiled
-                actor = StageActor.remote(self.compile_id, compiler_fn, new_example_inputs, parameters)
-                ray.get(actor.compile_graph.remote("graph_module.pt", data))
+                optim_fn = mod.optim_fn if hasattr(mod, 'optim_fn') else None
+                actor = StageActor.remote(
+                    self.compile_id, 
+                    compiler_fn, 
+                    new_example_inputs, 
+                    parameters, 
+                    optim_fn=optim_fn)
+                ray.get(actor.compile_graph.remote(buf))
 
                 # save a reference to the actor for cleanup
-                dynamo_tls.current_mod.ray_actors.append(actor)
+                mod.ray_actors.append(actor)
 
                 # patch in a Ray remote call to the compiled fx.Graph
+                import time
+                import json
                 def overwrite_compiled_fn(*args):
-                    out = actor.call.remote(*args)
-                    return ray.get(out)
+                    # print("actor call args:")
+                    # for arg in args:
+                    #     print("\t", arg.shape)
+                    start = time.perf_counter()
+                    out = actor.forward.remote(*args)
+                    end = time.perf_counter()
+                    print(f"dispatch actor call took {(end-start)*1000:.2f}ms")
+                    start = time.perf_counter()
+                    out = ray.get(out)
+                    end = time.perf_counter()
+                    print(f"wait actor call took {(end-start)*1000:.2f}ms")
+                    return out
 
                 compiled_fn = overwrite_compiled_fn
             else:

@@ -21,6 +21,9 @@ class MicroModel(nn.Module):
         x = x + 1
         return x
 
+    def big_tensor(self, x):
+        return torch.Tensor(x)
+
 
 model = MicroModel()
 compiled_model = torch.compile(model, distribute=True)

@@ -341,9 +341,9 @@ class TransformerBlock(nn.Module):
         return out
 
 
-
 def partition(*args):
     pass
+
 
 class Transformer(nn.Module):
     def __init__(self, params: ModelArgs):
@@ -430,7 +430,7 @@ class Transformer(nn.Module):
                 [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
             ).type_as(h)
 
-        for layer in self.layers[:self.n_layers//2]:
+        for layer in self.layers[: self.n_layers // 2]:
             h = layer(h, start_pos, freqs_cis, mask)
 
         print(h[0][0][0].item())
@@ -438,8 +438,10 @@ class Transformer(nn.Module):
         # free variables in stage2:
         #   self, h, start_pos, freqs_cis, mask
         # with new_stage():
-        for layer in self.layers[self.n_layers//2:]:
+        for layer in self.layers[self.n_layers // 2 :]:
             h = layer(h, start_pos, freqs_cis, mask)
+
+        print(h[0][0][0].item())
 
         h = self.norm(h) if self.norm else h
         output = self.output(h).float() if self.output else h

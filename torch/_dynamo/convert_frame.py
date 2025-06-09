@@ -619,7 +619,7 @@ class ConvertFrameAssert:
             },
         )
 
-        print(f"Attempting to convert frame {code.co_name} compile_id: {compile_id}")
+        log.debug(f"Attempting to convert frame {code.co_name} compile_id: {compile_id}")
 
         # Record traced frames, skipping Dynamo generated ones.
         if not code.co_name.startswith(TORCH_DYNAMO_RESUME_IN_PREFIX):
@@ -630,13 +630,13 @@ class ConvertFrameAssert:
         # Not yet used to make placement / scheduling decisions
         if code.co_name == "forward":
             fwd_name = f"{code.co_filename}:{code.co_firstlineno}"
-            print(f"Start compiling {fwd_name}")
+            log.debug(f"Start compiling {fwd_name}")
             dynamo_tls.currently_compiling = fwd_name
             if fwd_name in dynamo_tls.distributed_compilation_infos:
-                print(f"Previous compilation has {dynamo_tls.distributed_compilation_infos[fwd_name].num_graphs()} graphs")
+                log.debug(f"Previous compilation has {dynamo_tls.distributed_compilation_infos[fwd_name].num_graphs()} graphs")
                 dynamo_tls.distributed_compilation_infos[fwd_name].reset()
             else:
-                print("No previous compilation")
+                log.debug("No previous compilation")
                 dynamo_tls.distributed_compilation_infos[fwd_name] = DistributedCompilationInfo()
 
         with compile_context(CompileContext(compile_id)):
@@ -978,7 +978,7 @@ def _compile(
         if fwd_name:
             dynamo_tls.distributed_compilation_infos[fwd_name].add_graph(output)
             if "__resume_at_" not in dis.Bytecode(out_code).dis():
-                print(f"Finished compiling {fwd_name}, traced {dynamo_tls.distributed_compilation_infos[fwd_name].num_graphs()} graphs")
+                log.debug(f"Finished compiling {fwd_name}, traced {dynamo_tls.distributed_compilation_infos[fwd_name].num_graphs()} graphs")
                 dynamo_tls.currently_compiling = None
 
         return wrap_guarded_code(guarded_code)

@@ -1,7 +1,7 @@
 import ray
 import torch
 from torch import nn, optim
-from llama import Transformer, LLAMA_DEBUG, LLAMA_1B
+from models.llama import Transformer, LLAMA_DEBUG, LLAMA_1B
 
 llama_config = LLAMA_DEBUG
 
@@ -64,26 +64,27 @@ compiled_model(x2)
 import time
 
 # warmup
-for i in range(5):
-    compiled_model(x)
+for i in range(2):
     model(x)
-
-# timed
-
-start_compiled = time.perf_counter()
-for i in range(10):
     compiled_model(x)
-end_compiled = time.perf_counter()
 
-start_original = time.perf_counter()
-for i in range(10):
-    model(x)
-end_original = time.perf_counter()
+# print("SLEEPING")
+# time.sleep(5)
 
-print(f"Compiled time: {end_compiled-start_compiled:.6f}")
-print(f"Original time: {end_original-start_original:.6f}")
+# # timed
 
-import time
-time.sleep(3)
-ray.timeline(filename="timeline.json")
+# iters = 10
+
+# start_compiled = time.perf_counter()
+# for i in range(iters):
+#     compiled_model(x)
+# end_compiled = time.perf_counter()
+
+# start_original = time.perf_counter()
+# for i in range(iters):
+#     model(x)
+# end_original = time.perf_counter()
+
+# print(f"Compiled time: {(end_compiled-start_compiled)*1000/iters:.2f}ms")
+# print(f"Original time: {(end_original-start_original)*1000/iters:.2f}ms")
 # """

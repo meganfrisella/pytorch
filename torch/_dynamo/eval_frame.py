@@ -335,6 +335,9 @@ class OptimizedModule(torch.nn.Module):
         self.training = self._orig_mod.training
         self.ray_actors = []
 
+    def _set_optimizer(self, optim_fn):
+        self.optim_fn = optim_fn
+        
     def _initialize(self):
         # Do this stuff in constructor to lower overhead slightly
         if isinstance(self.dynamo_ctx, DisableContext):
@@ -591,8 +594,6 @@ class _TorchDynamoContext:
             self.enter_exit_hooks.append(call_backend_ctx)
 
     def __enter__(self):
-        # print(f"entering a dynamo context {self.ctxt_num}")
-
         if config.raise_on_ctx_manager_usage:
             raise RuntimeError(
                 "torch._dynamo.optimize(...) is used with a context manager. "

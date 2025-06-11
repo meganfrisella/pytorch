@@ -286,6 +286,16 @@ def graph_break(msg=""):
     """Force a graph break"""
 
 
+from .distribute_ray import StageActor
+from .eval_frame import dynamo_tls
+
+
+def distributed_stage(stage_id, optim=None):
+    actor = StageActor.remote(stage_id, optim_fn=optim)
+    dynamo_tls.current_actor = actor
+    dynamo_tls.current_mod.ray_actors.append(actor)
+
+
 def forbid_in_graph(fn):
     """
     Customize which functions TorchDynamo will assert are not present while tracing.

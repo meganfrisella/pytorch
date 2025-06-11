@@ -337,7 +337,10 @@ class OptimizedModule(torch.nn.Module):
 
     def _set_optimizer(self, optim_fn):
         self.optim_fn = optim_fn
-        
+
+    def _set_stage_dependencies(self, stage_deps):
+        self.stage_deps = stage_deps
+
     def _initialize(self):
         # Do this stuff in constructor to lower overhead slightly
         if isinstance(self.dynamo_ctx, DisableContext):
@@ -520,7 +523,11 @@ class DynamoTLS(threading.local):
     currently_compiling: str = None
 
     # The current module that is being compiled
-    current_mod : OptimizedModule = None
+    current_mod: OptimizedModule = None
+
+    # The actor associated with the current stage that is being compiled
+    current_actor = None
+
 
 dynamo_tls = DynamoTLS()
 

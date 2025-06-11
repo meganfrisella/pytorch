@@ -1366,12 +1366,13 @@ class OutputGraph(OutputGraphGuardsState):
         self.side_effects.codegen_hooks(cg)
 
         # Return variables used for logging at the end
-        for debug_var, args in tx.debug_locals:
-            cg.add_push_null(lambda: cg(debug_var))
-            for arg in args:
-                cg(arg)
-            cg.extend_output(create_call_function(len(args), False))
-            cg.extend_output([create_instruction("POP_TOP")])
+        if hasattr(tx, 'debug_locals'):
+            for debug_var, args in tx.debug_locals:
+                cg.add_push_null(lambda: cg(debug_var))
+                for arg in args:
+                    cg(arg)
+                cg.extend_output(create_call_function(len(args), False))
+                cg.extend_output([create_instruction("POP_TOP")])
 
         cg.restore_stack(stack_values, value_from_source=not tx.export)
         self.side_effects.codegen_update_mutated(cg)
@@ -1701,65 +1702,68 @@ class OutputGraph(OutputGraphGuardsState):
                 
                 # get all the graphargs that are model parameters in order and send those
                 # parameters to the actor
-                parameters = []
-                new_graphargs = []
-                mod = dynamo_tls.current_mod
+                # parameters = []
+                # new_graphargs = []
+                # mod = dynamo_tls.current_mod
 
-                def get_param(base: Source):
-                    if isinstance(base, ChainedSource):
-                        resource = get_param(base.base)
-                        if isinstance(base, AttrSource):
-                            return getattr(resource, base.member)
-                        elif isinstance(base, DictGetItemSource):
-                            return resource[base.index]
-                        elif isinstance(base, NNModuleSource):
-                            return resource
+                # def get_param(base: Source):
+                #     if isinstance(base, ChainedSource):
+                #         resource = get_param(base.base)
+                #         if isinstance(base, AttrSource):
+                #             return getattr(resource, base.member)
+                #         elif isinstance(base, DictGetItemSource):
+                #             return resource[base.index]
+                #         elif isinstance(base, NNModuleSource):
+                #             return resource
                         
-                    elif isinstance(base, LocalSource):
-                        assert base.local_name == "self"
-                        return mod._orig_mod
+                #     elif isinstance(base, LocalSource):
+                #         assert base.local_name == "self"
+                #         return mod._orig_mod
                     
-                    log.warn(f"got Source type {type(base)}")
-                    assert False and "Got unexpected Source type"
+                #     log.warn(f"got Source type {type(base)}")
+                #     assert False and "Got unexpected Source type"
 
-                for idx, arg in enumerate(self.graphargs):
-                    if "self" in str(arg):
-                        parameters.append(get_param(arg.source))
-                    else:
-                        parameters.append(None)
-                        new_graphargs.append(arg)
+                # for idx, arg in enumerate(self.graphargs):
+                #     print(arg)
+                #     if "self" in str(arg):
+                #         parameters.append(get_param(arg.source))
+                #     else:
+                #         parameters.append(None)
+                #         new_graphargs.append(arg)
                         
-                assert len(new_graphargs) == len(list(filter(lambda a: a is None, parameters)))
-                self.override_graphargs = new_graphargs
+                # assert len(new_graphargs) == len(list(filter(lambda a: a is None, parameters)))
+                # self.override_graphargs = new_graphargs
 
                 # instantiate a Ray actor and send the fx.Graph to get compiled
-                optim_fn = mod.optim_fn if hasattr(mod, 'optim_fn') else None
-                actor = StageActor.remote(
-                    self.compile_id, 
-                    compiler_fn, 
-                    new_example_inputs, 
-                    parameters, 
-                    optim_fn=optim_fn)
-                ray.get(actor.compile_graph.remote(buf))
+                # optim_fn = mod.optim_fn if hasattr(mod, 'optim_fn') else None
+                assert dynamo_tls.current_actor
+                actor = dynamo_tls.current_actor
+                # actor = StageActor.remote(
+                #     self.compile_id, 
+                #     compiler_fn, 
+                #     new_example_inputs, 
+                #     # parameters, 
+                #     optim_fn=optim_fn)
+                ray.get(actor.compile_graph.remote(self.compile_id, buf, compiler_fn, new_example_inputs))
 
                 # save a reference to the actor for cleanup
-                mod.ray_actors.append(actor)
+                # mod.ray_actors.append(actor)
 
                 # patch in a Ray remote call to the compiled fx.Graph
                 import time
-                import json
                 def overwrite_compiled_fn(*args):
+                    print(f"Calling actor {ray.get(actor.id.remote())} compiled_fn {self.compile_id}")
                     # print("actor call args:")
                     # for arg in args:
                     #     print("\t", arg.shape)
-                    start = time.perf_counter()
-                    out = actor.forward.remote(*args)
-                    end = time.perf_counter()
-                    print(f"dispatch actor call took {(end-start)*1000:.2f}ms")
-                    start = time.perf_counter()
+                    # start = time.perf_counter()
+                    out = actor.forward.remote(self.compile_id, *args)
+                    # end = time.perf_counter()
+                    # print(f"dispatch actor call took {(end-start)*1000:.2f}ms")
+                    # start = time.perf_counter()
                     out = ray.get(out)
-                    end = time.perf_counter()
-                    print(f"wait actor call took {(end-start)*1000:.2f}ms")
+                    # end = time.perf_counter()
+                    # print(f"wait actor call took {(end-start)*1000:.2f}ms")
                     return out
 
                 compiled_fn = overwrite_compiled_fn

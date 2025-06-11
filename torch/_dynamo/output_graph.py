@@ -152,6 +152,9 @@ from .variables.torch_function import TensorWithTFOverrideVariable
 
 from .eval_frame import dynamo_tls
 
+import ray
+from .distribute_ray import RemoteTensor
+
 if TYPE_CHECKING:
     from torch._dynamo.symbolic_convert import InstructionTranslatorBase
 
@@ -1684,87 +1687,75 @@ class OutputGraph(OutputGraphGuardsState):
                 compiler_fn = WrapperBackend(compiler_fn)
 
             if self.distribute:
-                import ray
-                from .distribute_ray import StageActor
 
                 # serialize the fx.Graph to compile on the actor
-                buf = io.BytesIO()
-                torch.save(gm, buf)
-                buf.seek(0)
+                graph_module_buf = io.BytesIO()
+                torch.save(gm, graph_module_buf)
+                graph_module_buf.seek(0)
 
                 # make sure the example inputs are serializable (get concrete values from symboilc ints)
-                new_example_inputs = []
-                for ex in self.example_inputs():
+                example_inputs = self.example_inputs()
+                serializable_example_inputs = []
+                for ex in example_inputs:
                     if isinstance(ex, torch.SymInt):
-                        new_example_inputs.append(int(ex))
+                        serializable_example_inputs.append(int(ex))
                     else:
-                        new_example_inputs.append(ex)
-                
-                # get all the graphargs that are model parameters in order and send those
-                # parameters to the actor
-                # parameters = []
-                # new_graphargs = []
-                # mod = dynamo_tls.current_mod
+                        serializable_example_inputs.append(ex)
 
-                # def get_param(base: Source):
-                #     if isinstance(base, ChainedSource):
-                #         resource = get_param(base.base)
-                #         if isinstance(base, AttrSource):
-                #             return getattr(resource, base.member)
-                #         elif isinstance(base, DictGetItemSource):
-                #             return resource[base.index]
-                #         elif isinstance(base, NNModuleSource):
-                #             return resource
-                        
-                #     elif isinstance(base, LocalSource):
-                #         assert base.local_name == "self"
-                #         return mod._orig_mod
-                    
-                #     log.warn(f"got Source type {type(base)}")
-                #     assert False and "Got unexpected Source type"
+                # TODO: revert logic that sends params to actors for now, for simplicity
+                # when implementing multiple fx.Graphs per actor.
 
-                # for idx, arg in enumerate(self.graphargs):
-                #     print(arg)
-                #     if "self" in str(arg):
-                #         parameters.append(get_param(arg.source))
-                #     else:
-                #         parameters.append(None)
-                #         new_graphargs.append(arg)
+                    # get all the graphargs that are model parameters in order and send those
+                    # parameters to the actor
+
+                    # parameters = []
+                    # new_graphargs = []
+                    # mod = dynamo_tls.current_mod
+
+                    # def get_param(base: Source):
+                    #     if isinstance(base, ChainedSource):
+                    #         resource = get_param(base.base)
+                    #         if isinstance(base, AttrSource):
+                    #             return getattr(resource, base.member)
+                    #         elif isinstance(base, DictGetItemSource):
+                    #             return resource[base.index]
+                    #         elif isinstance(base, NNModuleSource):
+                    #             return resource
+                            
+                    #     elif isinstance(base, LocalSource):
+                    #         assert base.local_name == "self"
+                    #         return mod._orig_mod
                         
-                # assert len(new_graphargs) == len(list(filter(lambda a: a is None, parameters)))
-                # self.override_graphargs = new_graphargs
+                    #     log.warn(f"got Source type {type(base)}")
+                    #     assert False and "Got unexpected Source type"
+
+                    # for idx, arg in enumerate(self.graphargs):
+                    #     print(arg)
+                    #     if "self" in str(arg):
+                    #         parameters.append(get_param(arg.source))
+                    #     else:
+                    #         parameters.append(None)
+                    #         new_graphargs.append(arg)
+                            
+                    # assert len(new_graphargs) == len(list(filter(lambda a: a is None, parameters)))
+                    # self.override_graphargs = new_graphargs
 
                 # instantiate a Ray actor and send the fx.Graph to get compiled
-                # optim_fn = mod.optim_fn if hasattr(mod, 'optim_fn') else None
                 assert dynamo_tls.current_actor
                 actor = dynamo_tls.current_actor
-                # actor = StageActor.remote(
-                #     self.compile_id, 
-                #     compiler_fn, 
-                #     new_example_inputs, 
-                #     # parameters, 
-                #     optim_fn=optim_fn)
-                ray.get(actor.compile_graph.remote(self.compile_id, buf, compiler_fn, new_example_inputs))
+                ray.get(actor.compile_graph.remote(
+                    self.compile_id, 
+                    graph_module_buf, 
+                    compiler_fn, 
+                    serializable_example_inputs))
 
-                # save a reference to the actor for cleanup
-                # mod.ray_actors.append(actor)
-
-                # patch in a Ray remote call to the compiled fx.Graph
-                import time
+                # the returned function makes a remote call to the compiled fx.Graph
+                # return the resulting Ray ObjectRef as a RemoteTensor, which additionally
+                # requires the fx.Graph and example inputs to compute the RemoteTensor shape
                 def overwrite_compiled_fn(*args):
-                    print(f"Calling actor {ray.get(actor.id.remote())} compiled_fn {self.compile_id}")
-                    # print("actor call args:")
-                    # for arg in args:
-                    #     print("\t", arg.shape)
-                    # start = time.perf_counter()
-                    out = actor.forward.remote(self.compile_id, *args)
-                    # end = time.perf_counter()
-                    # print(f"dispatch actor call took {(end-start)*1000:.2f}ms")
-                    # start = time.perf_counter()
-                    out = ray.get(out)
-                    # end = time.perf_counter()
-                    # print(f"wait actor call took {(end-start)*1000:.2f}ms")
-                    return out
+                    obj_ref = actor.call.remote(self.compile_id, *args)
+                    rt = RemoteTensor(example_inputs, gm, obj_ref)
+                    return [rt]
 
                 compiled_fn = overwrite_compiled_fn
             else:

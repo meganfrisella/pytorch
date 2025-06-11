@@ -4,6 +4,68 @@ import logging
 
 import os
 import time
+import uuid
+
+import torch.fx as fx
+from torch._subclasses.fake_tensor import FakeTensorMode
+
+_fake_tensor_mode = FakeTensorMode()
+_fake_tensor_converter = _fake_tensor_mode.fake_tensor_converter
+
+
+class RemoteTensorKey:
+    def __init__(self):
+        self.key = str(uuid.uuid4())
+
+
+class RemoteTensor(torch.Tensor):
+    _fake: torch.Tensor
+
+    def __new__(cls, example_inputs: list[torch.Tensor], graph_module: fx.GraphModule, obj_ref: ray._raylet.ObjectRef):
+        fake_inputs = []
+        for inp in example_inputs:
+            fake_inputs.append(_fake_tensor_converter.from_real_tensor(_fake_tensor_mode, inp))
+
+        with _fake_tensor_mode:
+            fake = graph_module.forward(*fake_inputs)
+
+        assert type(fake) == tuple
+        fake = fake[0]
+
+        instance = torch.Tensor._make_wrapper_subclass(
+            cls,
+            fake.size(),
+            strides=fake.stride(),
+            storage_offset=fake.storage_offset(),
+            device=fake.device,  # This is the device of of either input tensor or first tensor of a list
+            dtype=fake.dtype,
+            layout=fake.layout,
+            requires_grad=fake.requires_grad,
+        )
+        instance.obj_ref = obj_ref
+        instance.resolved = None
+        instance._fake = fake
+        instance.key = RemoteTensorKey()
+        return instance
+
+    def get(self):
+        if self.resolved is None:
+            self.resolved = ray.get(self.obj_ref)
+        assert type(self.resolved) == list
+        return self.resolved[0]
+
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        print(f"torch dispatch {func}")
+        def unwrap(x):
+            return x.get() if isinstance(x, RemoteTensor) else x
+        args = list(map(unwrap, args))
+        kwargs = {k: unwrap(v) for k, v in kwargs.items()}
+        out = func(*args, **kwargs)
+        return out
+    
+    def __repr__(self):
+        return f"RayTensor(obj_ref={self.obj_ref})"
+
 
 @ray.remote
 class StageActor:
@@ -12,9 +74,8 @@ class StageActor:
         self.log = logging.getLogger(__name__)
         self.log.setLevel(logging.INFO)
 
-        self.log.info(f"PID: {os.getpid()}")
+        self.log.info(f"Initializing Ray actor {id} with PID: {os.getpid()}")
 
-        self.log.debug(f"Initializing Ray actor {id}")
         start = time.perf_counter()
 
         self.id = id
@@ -29,11 +90,11 @@ class StageActor:
         #     self.optim = None
 
         end = time.perf_counter()
-        self.log.info(f"__init__ took {(end-start)*1000:.2f}ms")
+        self.log.debug(f"__init__ took {(end-start)*1000:.2f}ms")
 
     def id(self):
         return self.id
-    g
+    
     def compile_graph(self, id, gm_data, compiler_fn, example_inputs):
         start = time.perf_counter()
 
@@ -42,12 +103,14 @@ class StageActor:
         assert callable(compiled_fn), "compiler_fn did not return callable"
         self.compiled_fns[id] = compiled_fn
 
+        self.gm.print_readable()
+
         end = time.perf_counter()
-        self.log.info(f"compile_graph took {(end-start)*1000:.2f}ms")
+        self.log.debug(f"compile_graph took {(end-start)*1000:.2f}ms")
         return "Finished compiling"
 
-    def forward(self, id, *args):
-        self.log.debug(f"Calling forward on actor {self.id} with {len(args)} args")
+    def call(self, id, *args):
+        self.log.info(f"Calling forward on actor {self.id} with {len(args)} args")
         start = time.perf_counter()
 
         self.prev_activation = args[0]
@@ -75,7 +138,7 @@ class StageActor:
             self.activation = None
 
         end = time.perf_counter()  
-        self.log.info(f"forward took {(end-start)*1000:.2f}ms")
+        self.log.debug(f"forward took {(end-start)*1000:.2f}ms")
         return out
 
     def backward(self, grad=None, truth=None, loss_fn=None):

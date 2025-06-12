@@ -89,72 +89,84 @@ class StageActor:
 
         start = time.perf_counter()
 
-        self.id = id
+        self.actor_id = id
+        self.optim_fn = optim_fn
+
+        # map compile id -> compiled fx.Graph function
         self.compiled_fns = dict()
-        
-        # self.compiler_fn = compiler_fn
-        # self.example_inputs = example_inputs
-        # self.parameters = parameters
-        # if parameters and optim_fn:
-        #     self.optim = optim_fn([p for p in parameters if p is not None])
-        # else:
-        #     self.optim = None
+        # map compile id -> model parameters used by the fx.Graph
+        self.parameters = dict()
+        # map compile id -> optimizer for the fx.Graph
+        self.optims = dict()
 
         end = time.perf_counter()
         self.log.debug(f"__init__ took {(end-start)*1000:.2f}ms")
 
     def id(self):
-        return self.id
+        return self.actor_id
     
-    def compile_graph(self, id, gm_data, compiler_fn, example_inputs):
+    def compile_graph(self, id, gm_data, compiler_fn, example_inputs, parameters):
         start = time.perf_counter()
 
         self.gm = torch.load(gm_data, weights_only=False)
         compiled_fn = compiler_fn(self.gm, example_inputs)
         assert callable(compiled_fn), "compiler_fn did not return callable"
         self.compiled_fns[id] = compiled_fn
-
+        self.parameters[id] = parameters
+        if parameters:
+            assert self.optim_fn
+            self.optims[id] = self.optim_fn(
+                [p for p in parameters if p is not None])
 
         end = time.perf_counter()
         self.log.debug(f"compile_graph took {(end-start)*1000:.2f}ms")
         return "Finished compiling"
 
     def call(self, id, *args):
-        self.log.info(f"Calling forward on actor {self.id} with {len(args)} args")
+        self.log.info(f"Calling forward on actor {self.actor_id} with {len(args)} args")
         start = time.perf_counter()
 
+        start_args = time.perf_counter()
+
+        # Ray object refs resolve to a single element list
         def unwrap(x):
             if isinstance(x, list):
                 assert len(x) == 1
             return x[0] if isinstance(x, list) else x
         args = list(map(unwrap, args))
 
+        # TODO: assume the first input is the one we will backprop on
         self.prev_activation = args[0]
         if torch.is_floating_point(self.prev_activation):
             self.prev_activation.requires_grad_()
 
-        # new_args = list(args)
-        # all_args = []
-        # if self.parameters:
-        #     for arg in self.parameters:
-        #         if arg is not None:
-        #             all_args.append(arg)
-        #         else:
-        #             all_args.append(new_args[0])
-        #             del new_args[0]
-        # else:
-        #     all_args = new_args
+        new_args = list(args)
+        args_plus_parameters = []
+        if id in self.parameters:
+            parameters = self.parameters[id]
+            for arg in parameters:
+                if arg is not None:
+                    args_plus_parameters.append(arg)
+                else:
+                    args_plus_parameters.append(new_args[0])
+                    del new_args[0]
+        else:
+            args_plus_parameters = new_args
 
-        out = self.compiled_fns[id](*args)
+        end_args = time.perf_counter()
+
+        out = self.compiled_fns[id](*args_plus_parameters)
 
         act = [t for t in out if t.requires_grad]
         if act:
-            self.activation = act
+            assert len(act) == 1
+            self.activation = act[0]
         else: 
             self.activation = None
 
-        end = time.perf_counter()  
+        end = time.perf_counter()
         self.log.debug(f"forward took {(end-start)*1000:.2f}ms")
+        self.log.debug(f"processing args took {(end_args-start_args)*1000:.2f}ms")
         return out
 
     def backward(self, grad=None, truth=None, loss_fn=None):

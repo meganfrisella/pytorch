@@ -5,32 +5,41 @@ from torch import nn
 from models.stage_manager import stage_manager
 
 class MicroModel(nn.Module):
-    def __init__(self):
+    def __init__(self, inp_dim, out_dim):
         super().__init__()
+        self.c = torch.ones((out_dim))
+        self.layers = nn.ModuleList([
+            nn.Linear(inp_dim, out_dim),
+            nn.Linear(inp_dim, out_dim)])
+        self.norm = nn.RMSNorm((out_dim))
 
     def forward(self, x, y):
-        torch._dynamo.distributed_stage(1)
-        if x < 0:
-            x = x - 1
-        else:
-            x = x + 1
+        torch._dynamo.distributed_stage(1, optim=torch.optim.Adam)
+        x = self.layers[0](x)
 
-        torch._dynamo.distributed_stage(2)
-        y = y + 1
+        torch._dynamo.distributed_stage(2, optim=torch.optim.Adam)
+        y = self.layers[1](y)
+        y = self.norm(y)
 
-        torch._dynamo.distributed_stage(3)
-        z = x + y
+        torch._dynamo.distributed_stage(3, optim=torch.optim.Adam)
+        z = x + y + self.c
         return z
 
 
-model = MicroModel()
+inp_dim = 32
+out_dim = 1
+model = MicroModel(inp_dim, out_dim)
 compiled_model = torch.compile(model, distribute=True)
-compiled_model._set_stage_dependencies([(1,3), (2,3)])
+
 
 import time
 
-x = torch.Tensor([1])
-y = torch.Tensor([2])
+batch_size = 10
+x = torch.randn((batch_size, inp_dim))
+y = torch.randn((batch_size, inp_dim))
+
+out = model(x, y)
+print(out)
 
 out = compiled_model(x, y)
-print("result:", out)
+print(out.get())

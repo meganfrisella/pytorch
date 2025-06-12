@@ -1716,40 +1716,40 @@ class OutputGraph(OutputGraphGuardsState):
                 # TODO: revert logic that sends params to actors for now, for simplicity
                 # when implementing multiple fx.Graphs per actor.
 
-                    # get all the graphargs that are model parameters in order and send those
-                    # parameters to the actor
+                # get all the graphargs that are model parameters in order and send those
+                # parameters to the actor. accumulate a new list of graphargs (all the 
+                # original graphargs minus those which are model parameters)
 
-                    # parameters = []
-                    # new_graphargs = []
-                    # mod = dynamo_tls.current_mod
+                parameters = []
+                new_graphargs = []
+                mod = dynamo_tls.current_mod
 
-                    # def get_param(base: Source):
-                    #     if isinstance(base, ChainedSource):
-                    #         resource = get_param(base.base)
-                    #         if isinstance(base, AttrSource):
-                    #             return getattr(resource, base.member)
-                    #         elif isinstance(base, DictGetItemSource):
-                    #             return resource[base.index]
-                    #         elif isinstance(base, NNModuleSource):
-                    #             return resource
-                            
-                    #     elif isinstance(base, LocalSource):
-                    #         assert base.local_name == "self"
-                    #         return mod._orig_mod
+                def get_param(base: Source):
+                    if isinstance(base, ChainedSource):
+                        resource = get_param(base.base)
+                        if isinstance(base, AttrSource):
+                            return getattr(resource, base.member)
+                        elif isinstance(base, DictGetItemSource):
+                            return resource[base.index]
+                        elif isinstance(base, NNModuleSource):
+                            return resource
                         
-                    #     log.warn(f"got Source type {type(base)}")
-                    #     assert False and "Got unexpected Source type"
+                    elif isinstance(base, LocalSource):
+                        assert base.local_name == "self"
+                        return mod._orig_mod
+                    
+                    log.warn(f"got Source type {type(base)}")
+                    assert False and "Got unexpected Source type"
 
-                    # for idx, arg in enumerate(self.graphargs):
-                    #     print(arg)
-                    #     if "self" in str(arg):
-                    #         parameters.append(get_param(arg.source))
-                    #     else:
-                    #         parameters.append(None)
-                    #         new_graphargs.append(arg)
-                            
-                    # assert len(new_graphargs) == len(list(filter(lambda a: a is None, parameters)))
-                    # self.override_graphargs = new_graphargs
+                for idx, arg in enumerate(self.graphargs):
+                    if "self" in str(arg):
+                        parameters.append(get_param(arg.source))
+                    else:
+                        parameters.append(None)
+                        new_graphargs.append(arg)
+                        
+                assert len(new_graphargs) == len(list(filter(lambda a: a is None, parameters)))
+                self.override_graphargs = new_graphargs
 
                 # instantiate a Ray actor and send the fx.Graph to get compiled
                 assert dynamo_tls.current_actor
@@ -1758,7 +1758,8 @@ class OutputGraph(OutputGraphGuardsState):
                     self.compile_id, 
                     graph_module_buf, 
                     compiler_fn, 
-                    serializable_example_inputs))
+                    serializable_example_inputs,
+                    parameters))
 
                 fakes = get_fake_tensors(example_inputs, gm)
                 # the returned function makes a remote call to the compiled fx.Graph

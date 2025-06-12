@@ -409,7 +409,7 @@ class Transformer(nn.Module):
     def forward(self, tokens: torch.Tensor):
         # free variables in stage1:
         #   self, tokens
-        torch._dynamo.distributed_stage(1)
+        torch._dynamo.distributed_stage(1, optim=torch.optim.Adam)
         seqlen = tokens.shape[1]
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
@@ -435,7 +435,7 @@ class Transformer(nn.Module):
 
         # free variables in stage2:
         #   self, h, start_pos, freqs_cis, mask
-        torch._dynamo.distributed_stage(2)
+        torch._dynamo.distributed_stage(2, optim=torch.optim.Adam)
         for layer in self.layers[self.n_layers // 2 :]:
             h = layer(h, start_pos, freqs_cis, mask)
 

@@ -153,7 +153,7 @@ from .variables.torch_function import TensorWithTFOverrideVariable
 from .eval_frame import dynamo_tls
 
 import ray
-from .distribute_ray import RemoteTensor
+from .distribute_ray import RemoteTensor, get_fake_tensors
 
 if TYPE_CHECKING:
     from torch._dynamo.symbolic_convert import InstructionTranslatorBase
@@ -1693,12 +1693,23 @@ class OutputGraph(OutputGraphGuardsState):
                 torch.save(gm, graph_module_buf)
                 graph_module_buf.seek(0)
 
-                # make sure the example inputs are serializable (get concrete values from symboilc ints)
+                # make sure the example inputs are serializable by turning
+                # symbolic ints and fake tensors into concrete values
                 example_inputs = self.example_inputs()
                 serializable_example_inputs = []
                 for ex in example_inputs:
                     if isinstance(ex, torch.SymInt):
                         serializable_example_inputs.append(int(ex))
+                    elif isinstance(ex, torch._subclasses.fake_tensor.FakeTensor):
+                        new = torch.full(
+                            ex.shape,
+                            0,
+                            dtype=ex.dtype,
+                            device=ex.device,
+                            layout=ex.layout,
+                            requires_grad=ex.requires_grad,
+                        )
+                        serializable_example_inputs.append(new)
                     else:
                         serializable_example_inputs.append(ex)
 
@@ -1749,13 +1760,20 @@ class OutputGraph(OutputGraphGuardsState):
                     compiler_fn, 
                     serializable_example_inputs))
 
+                fakes = get_fake_tensors(example_inputs, gm)
                 # the returned function makes a remote call to the compiled fx.Graph
                 # return the resulting Ray ObjectRef as a RemoteTensor, which additionally
                 # requires the fx.Graph and example inputs to compute the RemoteTensor shape
                 def overwrite_compiled_fn(*args):
-                    obj_ref = actor.call.remote(self.compile_id, *args)
-                    rt = RemoteTensor(example_inputs, gm, obj_ref)
-                    return [rt]
+                    def unwrap(x):
+                        return x.get_ref() if isinstance(x, RemoteTensor) else x
+                    args = list(map(unwrap, args))
+                    refs = actor.call.options(num_returns=len(fakes)).remote(self.compile_id, *args)
+                    if isinstance(refs, list):
+                        return [RemoteTensor(fake, ref) for fake, ref in zip(fakes, refs)]
+                    else:
+                        assert len(fakes) == 1
+                        return [RemoteTensor(fakes[0], refs)]
 
                 compiled_fn = overwrite_compiled_fn
             else:

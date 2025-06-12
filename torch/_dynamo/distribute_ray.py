@@ -7,7 +7,7 @@ import time
 import uuid
 
 import torch.fx as fx
-from torch._subclasses.fake_tensor import FakeTensorMode
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
 _fake_tensor_mode = FakeTensorMode()
 _fake_tensor_converter = _fake_tensor_mode.fake_tensor_converter
@@ -18,20 +18,21 @@ class RemoteTensorKey:
         self.key = str(uuid.uuid4())
 
 
+def get_fake_tensors(example_inputs: list[torch.Tensor], graph_module: fx.GraphModule):
+    fake_inputs = []
+    for inp in example_inputs:
+        fake_inputs.append(_fake_tensor_converter.from_real_tensor(_fake_tensor_mode, inp))
+    with _fake_tensor_mode:
+        fakes = graph_module.forward(*fake_inputs)
+    return fakes
+
+
 class RemoteTensor(torch.Tensor):
     _fake: torch.Tensor
 
-    def __new__(cls, example_inputs: list[torch.Tensor], graph_module: fx.GraphModule, obj_ref: ray._raylet.ObjectRef):
-        fake_inputs = []
-        for inp in example_inputs:
-            fake_inputs.append(_fake_tensor_converter.from_real_tensor(_fake_tensor_mode, inp))
-
-        with _fake_tensor_mode:
-            fake = graph_module.forward(*fake_inputs)
-
-        assert type(fake) == tuple
-        fake = fake[0]
-
+    def __new__(cls, 
+                fake: list[FakeTensor], 
+                obj_ref: ray._raylet.ObjectRef):
         instance = torch.Tensor._make_wrapper_subclass(
             cls,
             fake.size(),
@@ -50,14 +51,24 @@ class RemoteTensor(torch.Tensor):
 
     def get(self):
         if self.resolved is None:
-            self.resolved = ray.get(self.obj_ref)
-        assert type(self.resolved) == list
-        return self.resolved[0]
+            obj = ray.get(self.obj_ref)
+            if isinstance(obj, list):
+                assert len(obj) == 1
+                self.resolved = obj[0]
+            else:
+                self.resolved = obj
+        return self.resolved
+    
+    def get_ref(self):
+        if self.resolved is None:
+            return self.obj_ref
+        else:
+            return None
 
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        print(f"torch dispatch {func}")
         def unwrap(x):
             return x.get() if isinstance(x, RemoteTensor) else x
+        print(f"dispatch {func} on {args}")
         args = list(map(unwrap, args))
         kwargs = {k: unwrap(v) for k, v in kwargs.items()}
         out = func(*args, **kwargs)
@@ -103,7 +114,6 @@ class StageActor:
         assert callable(compiled_fn), "compiler_fn did not return callable"
         self.compiled_fns[id] = compiled_fn
 
-        self.gm.print_readable()
 
         end = time.perf_counter()
         self.log.debug(f"compile_graph took {(end-start)*1000:.2f}ms")
@@ -112,6 +122,12 @@ class StageActor:
     def call(self, id, *args):
         self.log.info(f"Calling forward on actor {self.id} with {len(args)} args")
         start = time.perf_counter()
+
+        def unwrap(x):
+            if isinstance(x, list):
+                assert len(x) == 1
+            return x[0] if isinstance(x, list) else x
+        args = list(map(unwrap, args))
 
         self.prev_activation = args[0]
         if torch.is_floating_point(self.prev_activation):

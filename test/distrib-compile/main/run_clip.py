@@ -3,6 +3,8 @@ import torch
 from torch import nn, optim
 from models.clip import CLIP
 
+# torch._dynamo.reset()
+
 clip_config = {
     "embed_dim": 512,
     "image_resolution": 224,
@@ -17,11 +19,13 @@ clip_config = {
 }
 
 model = CLIP(**clip_config)
-compiled = torch.compile(model, distribute=False)
+compiled = torch.compile(model, distribute=True)
 
 batch_size = 100
 img = torch.randn(batch_size, 3, clip_config["image_resolution"], clip_config["image_resolution"])
 txt = torch.randint(0, clip_config["vocab_size"], (batch_size, clip_config["context_length"]))
 
 img_out, txt_out = model(img, txt)
+print(torch.sum(img_out))
 img_out, txt_out = compiled(img, txt)
+print(torch.sum(img_out))

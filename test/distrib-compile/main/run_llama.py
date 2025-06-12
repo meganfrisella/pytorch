@@ -17,6 +17,11 @@ seq_len = 32
 x = torch.randint(0, llama_config.vocab_size, (batch_size, seq_len))
 y = torch.zeros((batch_size, llama_config.vocab_size), dtype=torch.long)
 
+out = model(x)
+print(torch.sum(out))
+out = compiled_model(x)
+print(torch.sum(out))
+
 """
 # test backprop
 optim = optim_fn(model.parameters())
@@ -59,7 +64,7 @@ compiled_model(x1)
 compiled_model(x2)
 """
 
-# """
+"""
 # time overheads
 import time
 

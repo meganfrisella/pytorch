@@ -45,7 +45,7 @@ LLAMA_DEBUG = ModelArgs(
     n_layers=2,
     n_heads=32,
     n_kv_heads=8,
-    vocab_size=128256,
+    vocab_size=512,  # 128256,
     multiple_of=256,
     ffn_dim_multiplier=1.5,
     norm_eps=1e-5,
@@ -409,7 +409,7 @@ class Transformer(nn.Module):
     def forward(self, tokens: torch.Tensor):
         # free variables in stage1:
         #   self, tokens
-        # with new_stage():
+        torch._dynamo.distributed_stage(1)
         seqlen = tokens.shape[1]
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
@@ -433,15 +433,11 @@ class Transformer(nn.Module):
         for layer in self.layers[: self.n_layers // 2]:
             h = layer(h, start_pos, freqs_cis, mask)
 
-        print(h[0][0][0].item())
-
         # free variables in stage2:
         #   self, h, start_pos, freqs_cis, mask
-        # with new_stage():
+        torch._dynamo.distributed_stage(2)
         for layer in self.layers[self.n_layers // 2 :]:
             h = layer(h, start_pos, freqs_cis, mask)
-
-        print(h[0][0][0].item())
 
         h = self.norm(h) if self.norm else h
         output = self.output(h).float() if self.output else h

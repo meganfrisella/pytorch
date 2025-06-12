@@ -735,6 +735,13 @@ def _compile(
     def transform(
         instructions: list[Instruction], code_options: dict[str, object]
     ) -> None:
+        # Instead of tracing RemoteTensors, trace their
+        # FakeTensor representation
+        from .distribute_ray import RemoteTensor
+        for k, v in locals.items():
+            if isinstance(v, RemoteTensor):
+                locals[k] = v._fake
+
         nonlocal output
         nonlocal tracer
         speculation_log.restart()

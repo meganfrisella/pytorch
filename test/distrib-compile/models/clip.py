@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-# from ray_partition import new_stage
 
 
 class Bottleneck(nn.Module):
@@ -440,25 +439,21 @@ class CLIP(nn.Module):
         # free variables in stage1:
         #   self, image
         # use context managers
-
-        # with new_stage():
-
+        torch._dynamo.distributed_stage(1)
         image_features = self.encode_image(image)
         # normalize features
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
 
         # free variables in stage2:
         #   self, text
-        # with new_stage():
-
+        torch._dynamo.distributed_stage(2)
         text_features = self.encode_text(text)
         # normalize features
         text_features = text_features / text_features.norm(dim=1, keepdim=True)
 
         # free variables in stage3:
         #   self, image_features, text_features
-        # with new_stage():
-
+        torch._dynamo.distributed_stage(3)
         # cosine similarity as logits
         logit_scale = self.logit_scale.exp()
         logits_per_image = logit_scale * image_features @ text_features.t()

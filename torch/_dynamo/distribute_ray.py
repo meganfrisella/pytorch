@@ -8,6 +8,7 @@ import uuid
 
 import torch.fx as fx
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+from torch._guards import CompileId
 
 _fake_tensor_mode = FakeTensorMode()
 _fake_tensor_converter = _fake_tensor_mode.fake_tensor_converter
@@ -18,10 +19,13 @@ class RemoteTensorKey:
         self.key = str(uuid.uuid4())
 
 
-def get_fake_tensors(example_inputs: list[torch.Tensor], graph_module: fx.GraphModule):
+def get_fake_tensors(example_inputs, graph_module: fx.GraphModule):
     fake_inputs = []
     for inp in example_inputs:
-        fake_inputs.append(_fake_tensor_converter.from_real_tensor(_fake_tensor_mode, inp))
+        if isinstance(inp, torch.Tensor):
+            fake_inputs.append(_fake_tensor_converter.from_real_tensor(_fake_tensor_mode, inp))
+        else:
+            fake_inputs.append(inp)
     with _fake_tensor_mode:
         fakes = graph_module.forward(*fake_inputs)
     return fakes
@@ -68,7 +72,6 @@ class RemoteTensor(torch.Tensor):
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         def unwrap(x):
             return x.get() if isinstance(x, RemoteTensor) else x
-        print(f"dispatch {func} on {args}")
         args = list(map(unwrap, args))
         kwargs = {k: unwrap(v) for k, v in kwargs.items()}
         out = func(*args, **kwargs)
@@ -92,12 +95,18 @@ class StageActor:
         self.actor_id = id
         self.optim_fn = optim_fn
 
+        # ordered list of frame ids for ordering the fx.Graphs on this actor
+        self.frame_ids = []
         # map compile id -> compiled fx.Graph function
         self.compiled_fns = dict()
         # map compile id -> model parameters used by the fx.Graph
         self.parameters = dict()
         # map compile id -> optimizer for the fx.Graph
         self.optims = dict()
+        # map mb_idx -> previous activation (if this stage is not first)
+        self.prev_activations = dict()
+        # map mb_idx -> current activation
+        self.activations = dict()
 
         end = time.perf_counter()
         self.log.debug(f"__init__ took {(end-start)*1000:.2f}ms")
@@ -105,25 +114,55 @@ class StageActor:
     def id(self):
         return self.actor_id
     
-    def compile_graph(self, id, gm_data, compiler_fn, example_inputs, parameters):
+    def compile_graph(self, compile_id: CompileId, gm_data, compiler_fn, example_inputs, parameters):
+        self.log.info(f"Compiling graph on actor {self.actor_id}. compile id: {compile_id}. inputs: {len(example_inputs)}")
         start = time.perf_counter()
+
+        # if this is a recompile, assert the non-null parameters have the same shape
+        # TODO: this is a weak check
+        frame_id = compile_id.frame_id
+        if frame_id in self.parameters:
+            old_params = self.parameters[frame_id]
+            non_null_old_params = [p for p in old_params if p is not None]
+            non_null_new_params = [p for p in parameters if p is not None]
+
+            assert len(non_null_old_params) == len(non_null_new_params)
+            for p1, p2 in zip(non_null_old_params, non_null_new_params):
+                assert p1.shape == p2.shape
+            self.log.info(f"Recompiling frame_id {frame_id} on actor {self.actor_id}")
+
+            # save the new null pattern with the original parameters values
+            if len(old_params) != len(parameters):
+                old_idx = 0
+                for new_idx, p in enumerate(parameters):
+                    if p is not None:
+                        parameters[new_idx] = non_null_old_params[old_idx]
+                        old_idx += 1
+            self.parameters[frame_id] = parameters
+
+        # otherwise if this is a fresh compile, save the parameters and initialize the optimizer
+        else:
+            self.parameters[frame_id] = parameters
+            non_null_params = [p for p in parameters if p is not None]
+            if non_null_params:
+                assert self.optim_fn
+                self.optims[frame_id] = self.optim_fn(non_null_params)
+        
+        # save the frame id in an ordered list
+        if frame_id not in self.frame_ids:
+            self.frame_ids.append(frame_id)
 
         self.gm = torch.load(gm_data, weights_only=False)
         compiled_fn = compiler_fn(self.gm, example_inputs)
         assert callable(compiled_fn), "compiler_fn did not return callable"
-        self.compiled_fns[id] = compiled_fn
-        self.parameters[id] = parameters
-        if parameters:
-            assert self.optim_fn
-            self.optims[id] = self.optim_fn(
-                [p for p in parameters if p is not None])
+        self.compiled_fns[compile_id] = compiled_fn
 
         end = time.perf_counter()
         self.log.debug(f"compile_graph took {(end-start)*1000:.2f}ms")
         return "Finished compiling"
 
-    def call(self, id, *args):
-        self.log.info(f"Calling forward on actor {self.actor_id} with {len(args)} args")
+    def call(self, compile_id: CompileId, mb_idx: int, *args):
+        self.log.info(f"Calling forward {compile_id} mb {mb_idx} on actor {self.actor_id} with {len(args)} args")
         start = time.perf_counter()
 
         start_args = time.perf_counter()
@@ -135,16 +174,29 @@ class StageActor:
             return x[0] if isinstance(x, list) else x
         args = list(map(unwrap, args))
 
-        # TODO: assume the first input is the one we will backprop on
-        self.prev_activation = args[0]
-        if torch.is_floating_point(self.prev_activation):
-            self.prev_activation.requires_grad_()
+        # save the input to the first fx.Graph as the previous activation
+        frame_id = compile_id.frame_id
+        if frame_id == self.frame_ids[0]:
+            prev_activation = None
+            # TODO: assume the first tensor input is the one we will backprop on
+            for arg in args:
+                if isinstance(arg, torch.Tensor):
+                    prev_activation = arg
+                    if torch.is_floating_point(prev_activation):
+                        prev_activation.requires_grad_()
+                    self.prev_activations[mb_idx] = prev_activation
+                    break
+            assert mb_idx in self.prev_activations
 
+        # patch the args into the stored parameters list, which has None values for the args
+        frame_id = compile_id.frame_id
         new_args = list(args)
+        parameters = self.parameters[frame_id]
         args_plus_parameters = []
-        if id in self.parameters:
-            parameters = self.parameters[id]
-            for arg in parameters:
+
+        assert len(new_args) == len([p for p in parameters if p is None])
+        if frame_id in self.parameters:
+            for arg in self.parameters[frame_id]:
                 if arg is not None:
                     args_plus_parameters.append(arg)
                 else:
@@ -155,37 +207,47 @@ class StageActor:
 
         end_args = time.perf_counter()
 
-        out = self.compiled_fns[id](*args_plus_parameters)
+        out = self.compiled_fns[compile_id](*args_plus_parameters)
 
-        act = [t for t in out if t.requires_grad]
-        if act:
-            assert len(act) == 1
-            self.activation = act[0]
-        else: 
-            self.activation = None
+        # save the output of the last fx.Graph as the current activation
+        if frame_id == self.frame_ids[-1]:
+            act = [t for t in out if t.requires_grad]
+            if act:
+                assert len(act) == 1
+                self.activations[mb_idx] = act[0]
 
         end = time.perf_counter()
         self.log.debug(f"forward took {(end-start)*1000:.2f}ms")
         self.log.debug(f"processing args took {(end_args-start_args)*1000:.2f}ms")
         return out
 
-    def backward(self, grad=None, truth=None, loss_fn=None):
-        assert self.activation
-        if loss_fn:
-            assert truth is not None
-            loss = loss_fn(self.activation, truth)
-            loss.backward()
-        else:
-            assert grad is not None
-            self.activation.backward(grad)
+    def backward(self, mb_idx: int, inp, truth=None, loss_fn=None):
+        self.log.info(f"Calling backward on actor {self.actor_id}")
 
-        if self.prev_activation.requires_grad:
-            return self.prev_activation.grad
+        activation = self.activations[mb_idx]
+        assert activation is not None
+        assert inp is not None
+        # compute loss in the last stage. use the saved activation rather
+        # than inp because the saved activation remembers the computation graph
+        if truth is not None:
+            assert loss_fn is not None
+            loss = loss_fn(activation, truth)
+            loss.backward()
+        # if not the last stage, backprop on the stored activation given 
+        # the input gradient from the subsequent stage
+        else:
+            activation.backward(inp)
+
+        prev_activation = self.prev_activations[mb_idx]
+        assert prev_activation is not None
+        if prev_activation.requires_grad:
+            return prev_activation.grad
         else:
             return None
 
-    def update(self):
+    def update(self, *done_mbs):
         assert self.optim_fn
-        self.optim.step()
-        self.optim.zero_grad()
+        for _, optim in self.optims.items():
+            optim.step()
+            optim.zero_grad()
         return "done"

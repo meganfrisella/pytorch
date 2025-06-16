@@ -43,6 +43,7 @@ from typing import Any, Callable, NoReturn, Optional, TYPE_CHECKING, Union
 from weakref import ReferenceType
 
 import torch
+import torch._dynamo.distribute_ray
 import torch.overrides
 import torch.utils._device
 from torch._C._dynamo.eval_frame import code_framelocals_names
@@ -2317,6 +2318,8 @@ class GuardBuilder(GuardBuilderBase):
                     ),
                     guard,
                 )
+                # TESNOR_MATCH Tensor type assigned here
+                # print("HERE", value, size, stride, tensor_name, verbose_code_parts, pytype, dispatch_keys)
                 guard_manager.add_tensor_match_guard(
                     value,
                     size,
@@ -2727,6 +2730,10 @@ class CheckFunctionManager:
         shape_code_parts: Optional[ShapeCodeParts] = None,
     ):
         guards = output_graph.guards if output_graph else None
+        # TODO: for now, removing TENSOR_MATCH guards to pass RemoteTensors
+        # a better approach is changing the relevant guards to check the righ type
+        guards = [guard for guard in guards if guard.inner_create_fn().__name__ != "TENSOR_MATCH"]
+
         self._weakrefs: dict[int, ReferenceType[object]] = {}
 
         existing_diff_guard_sources = (

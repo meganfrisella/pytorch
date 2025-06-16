@@ -353,6 +353,7 @@ class OutputGraph(OutputGraphGuardsState):
         export: bool,
         export_constraints,
         frame_state,
+        compile_id,
         local_scope: Scope,
         global_scope: Scope,
         f_code,
@@ -380,6 +381,7 @@ class OutputGraph(OutputGraphGuardsState):
         self.cleanup_hooks: list[Callable[[], Any]] = []
         # compile_id is an id number for the current torch.compile
         self.compile_id: int = next(_compile_id_counter)
+        self.better_compile_id = compile_id
         # Set of globals installed via install_global* APIs
         self.installed_globals: set[str] = set()
 
@@ -1717,12 +1719,12 @@ class OutputGraph(OutputGraphGuardsState):
                 # when implementing multiple fx.Graphs per actor.
 
                 # get all the graphargs that are model parameters in order and send those
-                # parameters to the actor. accumulate a new list of graphargs (all the 
+                # parameters to the actor. accumulate a new list of graphargs (all the
                 # original graphargs minus those which are model parameters)
 
                 parameters = []
                 new_graphargs = []
-                mod = dynamo_tls.current_mod
+                mod = dynamo_tls.torch_module
 
                 def get_param(base: Source):
                     if isinstance(base, ChainedSource):
@@ -1754,22 +1756,28 @@ class OutputGraph(OutputGraphGuardsState):
                 # instantiate a Ray actor and send the fx.Graph to get compiled
                 assert dynamo_tls.current_actor
                 actor = dynamo_tls.current_actor
-                ray.get(actor.compile_graph.remote(
-                    self.compile_id, 
-                    graph_module_buf, 
-                    compiler_fn, 
-                    serializable_example_inputs,
-                    parameters))
+                compile_id = self.better_compile_id
+                ray.get(
+                    actor.compile_graph.remote(
+                        compile_id,
+                        graph_module_buf,
+                        compiler_fn,
+                        serializable_example_inputs,
+                        parameters,
+                    )
+                )
 
                 fakes = get_fake_tensors(example_inputs, gm)
+
                 # the returned function makes a remote call to the compiled fx.Graph
                 # return the resulting Ray ObjectRef as a RemoteTensor, which additionally
                 # requires the fx.Graph and example inputs to compute the RemoteTensor shape
                 def overwrite_compiled_fn(*args):
+                    mb_idx = torch._dynamo.eval_frame.dynamo_tls.current_mb
                     def unwrap(x):
                         return x.get_ref() if isinstance(x, RemoteTensor) else x
                     args = list(map(unwrap, args))
-                    refs = actor.call.options(num_returns=len(fakes)).remote(self.compile_id, *args)
+                    refs = actor.call.options(num_returns=len(fakes)).remote(compile_id, mb_idx, *args)
                     if isinstance(refs, list):
                         return [RemoteTensor(fake, ref) for fake, ref in zip(fakes, refs)]
                     else:

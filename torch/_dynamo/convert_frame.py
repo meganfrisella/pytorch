@@ -628,16 +628,17 @@ class ConvertFrameAssert:
         
         # Track the graphs generated for a forward call (across graph breaks)
         # Not yet used to make placement / scheduling decisions
-        if code.co_name == "forward":
-            fwd_name = f"{code.co_filename}:{code.co_firstlineno}"
-            log.debug(f"Start compiling {fwd_name}")
-            dynamo_tls.currently_compiling = fwd_name
-            if fwd_name in dynamo_tls.distributed_compilation_infos:
-                log.debug(f"Previous compilation has {dynamo_tls.distributed_compilation_infos[fwd_name].num_graphs()} graphs")
-                dynamo_tls.distributed_compilation_infos[fwd_name].reset()
-            else:
-                log.debug("No previous compilation")
-                dynamo_tls.distributed_compilation_infos[fwd_name] = DistributedCompilationInfo()
+
+            # if code.co_name == "forward":
+            #     fwd_name = f"{code.co_filename}:{code.co_firstlineno}"
+            #     log.debug(f"Start compiling {fwd_name}")
+            #     dynamo_tls.currently_compiling = fwd_name
+            #     if fwd_name in dynamo_tls.distributed_compilation_infos:
+            #         log.debug(f"Previous compilation has {dynamo_tls.distributed_compilation_infos[fwd_name].num_graphs()} graphs")
+            #         dynamo_tls.distributed_compilation_infos[fwd_name].reset()
+            #     else:
+            #         log.debug("No previous compilation")
+            #         dynamo_tls.distributed_compilation_infos[fwd_name] = DistributedCompilationInfo()
 
         with compile_context(CompileContext(compile_id)):
             return _compile(
@@ -759,6 +760,7 @@ def _compile(
             one_graph,
             export,
             export_constraints,
+            compile_id,
             frame_state=frame_state,
             speculation_log=speculation_log,
             exn_vt_stack=exn_vt_stack,
@@ -981,12 +983,13 @@ def _compile(
 
         # Track graphs generated for a forward call (across graph breaks)
         # Not yet used to make placement / scheduling decisions
-        fwd_name = dynamo_tls.currently_compiling
-        if fwd_name:
-            dynamo_tls.distributed_compilation_infos[fwd_name].add_graph(output)
-            if "__resume_at_" not in dis.Bytecode(out_code).dis():
-                log.debug(f"Finished compiling {fwd_name}, traced {dynamo_tls.distributed_compilation_infos[fwd_name].num_graphs()} graphs")
-                dynamo_tls.currently_compiling = None
+
+            # fwd_name = dynamo_tls.currently_compiling
+            # if fwd_name:
+            #     dynamo_tls.distributed_compilation_infos[fwd_name].add_graph(output)
+            #     if "__resume_at_" not in dis.Bytecode(out_code).dis():
+            #         log.debug(f"Finished compiling {fwd_name}, traced {dynamo_tls.distributed_compilation_infos[fwd_name].num_graphs()} graphs")
+            #         dynamo_tls.currently_compiling = None
 
         return wrap_guarded_code(guarded_code)
 

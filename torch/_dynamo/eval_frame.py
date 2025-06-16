@@ -333,7 +333,7 @@ class OptimizedModule(torch.nn.Module):
         self.dynamo_ctx = dynamo_ctx
         self._initialize()
         self.training = self._orig_mod.training
-        self.ray_actors = []
+        self._ray_actors = dict()
 
     def _set_optimizer(self, optim_fn):
         self.optim_fn = optim_fn
@@ -517,17 +517,19 @@ class DynamoTLS(threading.local):
     traced_frame_infos: list[str] = []
 
     # Distributed compilation summary for each nn.Module that gets compiled
-    distributed_compilation_infos: Dict[str, DistributedCompilationInfo] = {}
+    # distributed_compilation_infos: Dict[str, DistributedCompilationInfo] = {}
 
     # The name of the forward function that is currently being compiled, if any
-    currently_compiling: str = None
+    # currently_compiling: str = None
 
-    # The current module that is being compiled
-    current_mod: OptimizedModule = None
+    # The torch module that is being compiled
+    torch_module: OptimizedModule = None
 
-    # The actor associated with the current stage that is being compiled
+    # The actor associated with the current stage that is being compiled or run
     current_actor = None
 
+    # The current runtime microbatch
+    current_mb = None
 
 dynamo_tls = DynamoTLS()
 
@@ -642,7 +644,7 @@ class _TorchDynamoContext:
         if isinstance(fn, torch.nn.Module):
             mod = fn
             new_mod = OptimizedModule(mod, self)
-            dynamo_tls.current_mod = new_mod
+            dynamo_tls.torch_module = new_mod
 
             # Save the function pointer to find the original callable while nesting
             # of decorators.

@@ -15,17 +15,17 @@ seq_len = 32
 x = torch.randint(0, llama_config.vocab_size, (batch_size, seq_len))
 y = torch.zeros((batch_size, llama_config.vocab_size), dtype=torch.long)
 
-# """
+"""
 # test microbatching
 
-out = compiled_model(x, mb=42)
+out = compiled_model(x, dynamo_mb=42)
 stg1 = compiled_model._ray_actors[1]
 stg2 = compiled_model._ray_actors[2]
 
 done_stg1 = []
 done_stg2 = []
 for mb in range(2):
-    out = compiled_model(x, mb=mb)
+    out = compiled_model(x, dynamo_mb=mb)
     grad2 = stg2.backward.remote(mb, out.get_ref(), truth=y, loss_fn=loss_fn)
     grad1 = stg1.backward.remote(mb, grad2)
     done_stg2.append(grad2)
@@ -35,26 +35,25 @@ upd2 = stg2.update.remote(*done_stg2)
 upd1 = stg1.update.remote(*done_stg1)
 ray.get([upd2, upd1])
 
-# """
-
 """
+
+# """
 # test backprop
 
-mb_idx = 0
-out = compiled_model(x, mb_idx=mb_idx)
+out = compiled_model(x)
 stg1 = compiled_model._ray_actors[1]
 stg2 = compiled_model._ray_actors[2]
 
-grad2 = stg2.backward.remote(mb_idx, out.get_ref(), truth=y, loss_fn=loss_fn)
-grad1 = stg1.backward.remote(mb_idx, grad2)
+grad2 = stg2.backward.remote(0, out.get_ref(), truth=y, loss_fn=loss_fn)
+grad1 = stg1.backward.remote(0, grad2)
 upd2 = stg2.update.remote(grad2)
 upd1 = stg1.update.remote(grad1)
 ray.get([upd2, upd1])
 
-out = compiled_model(x, mb_idx=mb_idx)
+out = compiled_model(x)
 print(torch.sum(out))
 
-out = compiled_model(x, mb_idx=mb_idx)
+out = compiled_model(x)
 print(torch.sum(out))
 
 optim = optim.Adam(model.parameters())
@@ -66,7 +65,7 @@ optim.zero_grad()
 out = model(x)
 print(torch.sum(out))
 
-"""
+# """
 
 """
 # test calling previously-compiled code again and test re-compilation

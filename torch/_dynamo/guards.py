@@ -2730,13 +2730,19 @@ class CheckFunctionManager:
         shape_code_parts: Optional[ShapeCodeParts] = None,
     ):
         guards = output_graph.guards if output_graph else None
-        # TODO: for now, removing TENSOR_MATCH guards to pass RemoteTensors
-        # a better approach is changing the relevant guards to check the righ type
+        # WIP patch to fix recompilation bugs
+        # filter out TENSOR_MATCH guards to pass RemoteTensors to compiled functions
+        #   TODO: change the type of TENSOR_MATCH guards for RemoteTensor inputs
+        # filter out CONSTANT_MATCH guards on 'dynamo_mb' input to pass arbitrary mb index
+        #   TODO: fix so that user does not need to include dynamo_mb kwarg
         def filter_guards(guard):
             return not (
                 guard.inner_create_fn().__name__ == "TENSOR_MATCH" or 
-                guard.name == "L['mb']")
+                guard.name == "L['dynamo_mb']")
         guards = list(filter(filter_guards, guards))
+        # for guard in guards:
+        #     print(guard)
+        #     print()
 
         self._weakrefs: dict[int, ReferenceType[object]] = {}
 

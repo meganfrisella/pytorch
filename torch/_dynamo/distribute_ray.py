@@ -64,10 +64,7 @@ class RemoteTensor(torch.Tensor):
         return self.resolved
     
     def get_ref(self):
-        if self.resolved is None:
-            return self.obj_ref
-        else:
-            return None
+        return self.obj_ref
 
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         def unwrap(x):
@@ -174,19 +171,15 @@ class StageActor:
             return x[0] if isinstance(x, list) else x
         args = list(map(unwrap, args))
 
-        # save the input to the first fx.Graph as the previous activation
+        # save all inputs with gradients as previous activations for backprop
         frame_id = compile_id.frame_id
         if frame_id == self.frame_ids[0]:
-            prev_activation = None
-            # TODO: assume the first tensor input is the one we will backprop on
+            prev_activations = []
             for arg in args:
-                if isinstance(arg, torch.Tensor):
-                    prev_activation = arg
-                    if torch.is_floating_point(prev_activation):
-                        prev_activation.requires_grad_()
-                    self.prev_activations[mb_idx] = prev_activation
-                    break
-            assert mb_idx in self.prev_activations
+                # print(f"{arg.shape}, {arg.requires_grad}")
+                if isinstance(arg, torch.Tensor) and arg.requires_grad:
+                    prev_activations.append(arg)
+            self.prev_activations[mb_idx] = prev_activations
 
         # patch the args into the stored parameters list, which has None values for the args
         frame_id = compile_id.frame_id
@@ -209,12 +202,9 @@ class StageActor:
 
         out = self.compiled_fns[compile_id](*args_plus_parameters)
 
-        # save the output of the last fx.Graph as the current activation
+        # save all outputs which require gradients as the activations
         if frame_id == self.frame_ids[-1]:
-            act = [t for t in out if t.requires_grad]
-            if act:
-                assert len(act) == 1
-                self.activations[mb_idx] = act[0]
+            self.activations[mb_idx] = [t for t in out if t.requires_grad]
 
         end = time.perf_counter()
         self.log.debug(f"forward took {(end-start)*1000:.2f}ms")
@@ -224,9 +214,11 @@ class StageActor:
     def backward(self, mb_idx: int, inp, truth=None, loss_fn=None):
         self.log.info(f"Calling backward on actor {self.actor_id}")
 
-        activation = self.activations[mb_idx]
-        assert activation is not None
         assert inp is not None
+
+        activation = self.activations[mb_idx]
+        assert activation is not None and len(activation) == 1
+        activation = activation[0]
         # compute loss in the last stage. use the saved activation rather
         # than inp because the saved activation remembers the computation graph
         if truth is not None:
@@ -236,12 +228,11 @@ class StageActor:
         # if not the last stage, backprop on the stored activation given 
         # the input gradient from the subsequent stage
         else:
-            activation.backward(inp)
+            activation.backward(gradient=inp)
 
-        prev_activation = self.prev_activations[mb_idx]
-        assert prev_activation is not None
-        if prev_activation.requires_grad:
-            return prev_activation.grad
+        prev_activations = self.prev_activations[mb_idx]
+        if prev_activations:
+            return [act.grad for act in prev_activations]
         else:
             return None
 

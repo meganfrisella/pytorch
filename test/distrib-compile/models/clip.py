@@ -430,37 +430,33 @@ class CLIP(nn.Module):
 
         return x
 
-    # forward DAG:
-    #   image  ->   stage1   ->
-    #                             stage3    ->    logits_per_image, logits_per_text
-    #   text   ->   stage2   ->
-    def forward(self, image, text):
+    def forward(self, image, text, dynamo_mb: int=0):
 
-        # free variables in stage1:
-        #   self, image
-        # use context managers
-        torch._dynamo.distributed_stage(1)
+        torch._dynamo.distributed_stage(1, mb=dynamo_mb, optim=torch.optim.Adam)
+
         image_features = self.encode_image(image)
         # normalize features
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
 
-        # free variables in stage2:
-        #   self, text
-        torch._dynamo.distributed_stage(2)
+
+
+        torch._dynamo.distributed_stage(2, mb=dynamo_mb, optim=torch.optim.Adam)
+
         text_features = self.encode_text(text)
         # normalize features
         text_features = text_features / text_features.norm(dim=1, keepdim=True)
 
-        # free variables in stage3:
-        #   self, image_features, text_features
-        torch._dynamo.distributed_stage(3)
+
+
+        torch._dynamo.distributed_stage(3, mb=dynamo_mb, optim=torch.optim.Adam)
+
         # cosine similarity as logits
         logit_scale = self.logit_scale.exp()
         logits_per_image = logit_scale * image_features @ text_features.t()
-        logits_per_text = logits_per_image.t()
+        # logits_per_text = logits_per_image.t()
 
         # shape = [global_batch_size, global_batch_size]
-        return logits_per_image, logits_per_text
+        return logits_per_image #, logits_per_text
 
 
 def convert_weights(model: nn.Module):

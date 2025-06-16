@@ -290,10 +290,14 @@ from .distribute_ray import StageActor
 from .eval_frame import dynamo_tls
 
 
-def distributed_stage(stage_id, optim=None):
-    actor = StageActor.remote(stage_id, optim_fn=optim)
-    dynamo_tls.current_actor = actor
-    dynamo_tls.current_mod.ray_actors.append(actor)
+def distributed_stage(stage_id, mb=None, optim=None):
+    dynamo_tls.current_mb = mb
+    if stage_id not in dynamo_tls.torch_module._ray_actors:
+        actor = StageActor.remote(stage_id, optim_fn=optim)
+        dynamo_tls.current_actor = actor
+        dynamo_tls.torch_module._ray_actors[stage_id] = actor
+    else:
+        dynamo_tls.current_actor = dynamo_tls.torch_module._ray_actors[stage_id]
 
 
 def forbid_in_graph(fn):

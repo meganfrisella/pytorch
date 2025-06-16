@@ -2732,7 +2732,11 @@ class CheckFunctionManager:
         guards = output_graph.guards if output_graph else None
         # TODO: for now, removing TENSOR_MATCH guards to pass RemoteTensors
         # a better approach is changing the relevant guards to check the righ type
-        guards = [guard for guard in guards if guard.inner_create_fn().__name__ != "TENSOR_MATCH"]
+        def filter_guards(guard):
+            return not (
+                guard.inner_create_fn().__name__ == "TENSOR_MATCH" or 
+                guard.name == "L['mb']")
+        guards = list(filter(filter_guards, guards))
 
         self._weakrefs: dict[int, ReferenceType[object]] = {}
 

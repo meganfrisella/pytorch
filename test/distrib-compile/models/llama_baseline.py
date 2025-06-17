@@ -404,10 +404,7 @@ class Transformer(nn.Module):
             params.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor, dynamo_mb: int=0):
-
-        torch._dynamo.distributed_stage(0, mb=dynamo_mb, optim=torch.optim.Adam)
-
+    def forward(self, tokens: torch.Tensor):
         seqlen = tokens.shape[1]
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
@@ -428,14 +425,7 @@ class Transformer(nn.Module):
                 [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
             ).type_as(h)
 
-        for layer in self.layers[: self.n_layers // 2]:
-            h = layer(h, start_pos, freqs_cis, mask)
-
-
-
-        torch._dynamo.distributed_stage(1, mb=dynamo_mb, optim=torch.optim.Adam)
-
-        for layer in self.layers[self.n_layers // 2 :]:
+        for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
 
         h = self.norm(h) if self.norm else h

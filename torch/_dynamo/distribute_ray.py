@@ -159,7 +159,7 @@ class StageActor:
         return "Finished compiling"
 
     def call(self, compile_id: CompileId, mb_idx: int, *args):
-        self.log.info(f"Calling forward {compile_id} mb {mb_idx} on actor {self.actor_id} with {len(args)} args")
+        self.log.debug(f"Calling forward {compile_id} mb {mb_idx} on actor {self.actor_id} with {len(args)} args")
         start = time.perf_counter()
 
         start_args = time.perf_counter()
@@ -212,7 +212,7 @@ class StageActor:
         return out
 
     def backward(self, mb_idx: int, inp, truth=None, loss_fn=None):
-        self.log.info(f"Calling backward on actor {self.actor_id}")
+        self.log.debug(f"Calling backward on actor {self.actor_id}")
 
         assert inp is not None
 

@@ -1688,6 +1688,11 @@ class OutputGraph(OutputGraphGuardsState):
             if config.verify_correctness:
                 compiler_fn = WrapperBackend(compiler_fn)
 
+
+            print(f"Compiling function {self.better_compile_id} for stage {dynamo_tls.current_stage}")
+            # gm.print_readable()
+
+
             if self.distribute:
 
                 # serialize the fx.Graph to compile on the actor

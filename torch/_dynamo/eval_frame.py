@@ -528,6 +528,9 @@ class DynamoTLS(threading.local):
     # The actor associated with the current stage that is being compiled or run
     current_actor = None
 
+    # The id of the current stage
+    current_stage = None
+
     # The current runtime microbatch
     current_mb = None
 

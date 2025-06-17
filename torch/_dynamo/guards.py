@@ -2735,14 +2735,23 @@ class CheckFunctionManager:
         #   TODO: change the type of TENSOR_MATCH guards for RemoteTensor inputs
         # filter out CONSTANT_MATCH guards on 'dynamo_mb' input to pass arbitrary mb index
         #   TODO: fix so that user does not need to include dynamo_mb kwarg
-        def filter_guards(guard):
-            return not (
-                guard.inner_create_fn().__name__ == "TENSOR_MATCH" or 
-                guard.name == "L['dynamo_mb']")
-        guards = list(filter(filter_guards, guards))
+        # def filter_guards(guard):
+        #     return not (
+        #         guard.inner_create_fn().__name__ == "TENSOR_MATCH" or 
+        #         guard.name == "L['dynamo_mb']" or
+        #         guard.inner_create_fn().__name__ == "TORCH_FUNCTION_STATE" or
+        #         guard.inner_create_fn().__name__ == "GRAD_MODE" or
+        #         guard.inner_create_fn().__name__ == "FUNCTION_MATCH" or
+        #         guard.inner_create_fn().__name__ == "SHAPE_ENV" or
+        #         guard.inner_create_fn().__name__ == "ID_MATCH" or
+        #         guard.inner_create_fn().__name__ == "DEFAULT_DEVICE" or
+        #         guard.inner_create_fn().__name__ == "DETERMINISTIC_ALGORITHMS" or
+        #         guard.inner_create_fn().__name__ == "AUTOGRAD_SAVED_TENSORS_HOOKS")
+        # guards = list(filter(filter_guards, guards))
         # for guard in guards:
         #     print(guard)
         #     print()
+        guards = None
 
         self._weakrefs: dict[int, ReferenceType[object]] = {}
 

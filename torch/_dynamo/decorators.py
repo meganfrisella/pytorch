@@ -294,9 +294,11 @@ def distributed_stage(stage_id, mb=None, optim=None):
     dynamo_tls.current_mb = mb
     if stage_id not in dynamo_tls.torch_module._ray_actors:
         actor = StageActor.remote(stage_id, optim_fn=optim)
+        dynamo_tls.current_stage = stage_id
         dynamo_tls.current_actor = actor
         dynamo_tls.torch_module._ray_actors[stage_id] = actor
     else:
+        dynamo_tls.current_stage = stage_id
         dynamo_tls.current_actor = dynamo_tls.torch_module._ray_actors[stage_id]
 
 

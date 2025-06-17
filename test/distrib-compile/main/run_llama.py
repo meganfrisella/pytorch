@@ -53,7 +53,7 @@ def iter_1f1b():
     upd1 = stg1.update.remote(*done_stg1)
     ray.get([upd2, upd1])
 
-g
+
 # build high-level schedule
 schedule = build_1f1b_schedule(num_mbs, 2)
 dag_edges = [DAGEdge(0, 1), DAGEdge(1, 2)]

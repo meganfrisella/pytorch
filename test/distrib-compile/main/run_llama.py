@@ -20,7 +20,7 @@ y = torch.zeros((batch_size, llama_config.vocab_size), dtype=torch.long)
 # time microbatch schedules
 
 from .llama_schedules import build_1f1b_schedule, build_gpipe_schedule
-from torch._dynamo.scheduling import DAGEdge, execute_schedule
+from torch._dynamo.scheduling import Task, DAGEdge, execute_schedule
 import time
 
 warmup = 3
@@ -35,8 +35,8 @@ stg2 = compiled._ray_actors[1]
 # "1F1B" schedule
 
 
-# manual implementation
-def iter_1f1b():
+# manual schedule
+def iter_1f1b_manual():
     done_stg1 = []
     done_stg2 = []
 
@@ -67,6 +67,7 @@ def iter_1f1b():
 # warmup
 for _ in range(warmup):
     iter_1f1b()
+    iter_1f1b_manual()
 
 # time
 start = time.perf_counter()
@@ -75,17 +76,25 @@ for _ in range(iters):
 end = time.perf_counter()
 
 print(
-    f"1F1B throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
+    f"1F1B execute_schedule throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
+)
+
+# time
+start = time.perf_counter()
+for _ in range(iters):
+    iter_1f1b_manual()
+end = time.perf_counter()
+
+print(
+    f"1F1B manual schedule throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
 )
 
 
 # "GPIPE" schedule
 
-from torch._dynamo.scheduling import Task, DAGEdge, execute_schedule
 
-
-# manual implementation
-def iter_gpipe():
+# manual schedule
+def iter_gpipe_manual():
     fwd_refs = []
     done_stg1 = []
     done_stg2 = []
@@ -120,6 +129,7 @@ def iter_gpipe():
 # warmup
 for _ in range(warmup):
     iter_gpipe()
+    iter_gpipe_manual()
 
 # time
 start = time.perf_counter()
@@ -128,7 +138,17 @@ for _ in range(iters):
 end = time.perf_counter()
 
 print(
-    f"GPipe throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
+    f"GPipe execute_schedule throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
+)
+
+# time
+start = time.perf_counter()
+for _ in range(iters):
+    iter_gpipe_manual()
+end = time.perf_counter()
+
+print(
+    f"GPipe manual schedule throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
 )
 
 

@@ -41,8 +41,8 @@ class ModelArgs:
 
 
 LLAMA_DEBUG = ModelArgs(
-    dim=128,
-    n_layers=2,
+    dim=512,
+    n_layers=4,
     n_heads=32,
     n_kv_heads=8,
     vocab_size=512,  # 128256,

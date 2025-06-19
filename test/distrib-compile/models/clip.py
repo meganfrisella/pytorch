@@ -432,7 +432,7 @@ class CLIP(nn.Module):
 
     def forward(self, image, text, dynamo_mb: int=0):
 
-        torch._dynamo.distributed_stage(1, mb=dynamo_mb, optim=torch.optim.Adam)
+        torch._dynamo.distributed_stage(0, mb=dynamo_mb, optim=torch.optim.Adam)
 
         image_features = self.encode_image(image)
         # normalize features
@@ -440,7 +440,7 @@ class CLIP(nn.Module):
 
 
 
-        torch._dynamo.distributed_stage(2, mb=dynamo_mb, optim=torch.optim.Adam)
+        torch._dynamo.distributed_stage(1, mb=dynamo_mb, optim=torch.optim.Adam)
 
         text_features = self.encode_text(text)
         # normalize features
@@ -448,7 +448,7 @@ class CLIP(nn.Module):
 
 
 
-        torch._dynamo.distributed_stage(3, mb=dynamo_mb, optim=torch.optim.Adam)
+        torch._dynamo.distributed_stage(2, mb=dynamo_mb, optim=torch.optim.Adam)
 
         # cosine similarity as logits
         logit_scale = self.logit_scale.exp()

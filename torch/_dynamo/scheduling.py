@@ -46,7 +46,7 @@ def execute_schedule(model, schedule, dag_edges: list[DAGEdge], params, truth, l
                 else:
                     # log order of task dispatch by printing
                     # also see output_graph.py:1785 where we log forward dispatch
-                    print(f"Calling backward stage {stage_id} mb {mb_idx}")
+                    # print(f"Calling backward stage {stage_id} mb {mb_idx}")
                     num_bwd_targets = len(get_backward_targets(stage_id, dag_edges))
                     if mb_idx not in bwd_ref_dicts:
                         # if this is the first backward task for a microbatch, dispatch the

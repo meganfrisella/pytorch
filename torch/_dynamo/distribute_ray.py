@@ -13,6 +13,7 @@ from torch._guards import CompileId
 _fake_tensor_mode = FakeTensorMode()
 _fake_tensor_converter = _fake_tensor_mode.fake_tensor_converter
 
+torch.set_float32_matmul_precision('high')
 
 class RemoteTensorKey:
     def __init__(self):
@@ -139,6 +140,12 @@ class StageActor:
 
         # otherwise if this is a fresh compile, save the parameters and initialize the optimizer
         else:
+            def send_to_device(param):
+                if isinstance(param, torch.Tensor):
+                    return param.to('cuda')
+                else:
+                    return param
+            parameters = list(map(send_to_device, parameters))
             self.parameters[frame_id] = parameters
             non_null_params = [p for p in parameters if p is not None]
             if non_null_params:
@@ -171,15 +178,28 @@ class StageActor:
             return x[0] if isinstance(x, list) else x
         args = list(map(unwrap, args))
 
+        def send_to_device(param):
+            if isinstance(param, torch.Tensor):
+                return param.to('cuda')
+            else:
+                return param
+        args = list(map(send_to_device, args))
+
         # save all inputs with gradients as previous activations for backprop
         frame_id = compile_id.frame_id
         if frame_id == self.frame_ids[0]:
-            prev_activations = []
-            for arg in args:
-                # print(f"{arg.shape}, {arg.requires_grad}")
-                if isinstance(arg, torch.Tensor) and arg.requires_grad:
-                    prev_activations.append(arg)
-            self.prev_activations[mb_idx] = prev_activations
+            if self.actor_id > 0:
+                args[0].requires_grad_()
+                self.prev_activations[mb_idx] = [args[0]]
+            else:
+                self.prev_activations[mb_idx] = []
+            # prev_activations = []
+            # for arg in args:
+            #     print(f"actor: {self.actor_id}, mb: {mb_idx}, inp: {arg.shape}, {arg.requires_grad}")
+            #     if isinstance(arg, torch.Tensor) and arg.requires_grad:
+            #         prev_activations.append(arg)
+            # self.prev_activations[mb_idx] = prev_activations
+            # self.log.info(f"forward actor {self.actor_id} mb {mb_idx} prev_activations: {len(prev_activations)}")
 
         # patch the args into the stored parameters list, which has None values for the args
         frame_id = compile_id.frame_id
@@ -200,19 +220,26 @@ class StageActor:
 
         end_args = time.perf_counter()
 
+        start_fx = time.perf_counter()
         out = self.compiled_fns[compile_id](*args_plus_parameters)
+        end_fx = time.perf_counter()
 
         # save all outputs which require gradients as the activations
         if frame_id == self.frame_ids[-1]:
+            # for t in out:
+            #     print(f"out: {t.shape}, {t.requires_grad}")
             self.activations[mb_idx] = [t for t in out if t.requires_grad]
 
+
         end = time.perf_counter()
-        self.log.debug(f"forward took {(end-start)*1000:.2f}ms")
+        self.log.debug(f"forward {self.actor_id} took {(end-start)*1000:.2f}ms")
+        self.log.debug(f"compute took {(end_fx-start_fx)*1000:.2f}ms")
         self.log.debug(f"processing args took {(end_args-start_args)*1000:.2f}ms")
         return out
 
     def backward(self, mb_idx: int, inp, truth=None, loss_fn=None):
-        self.log.debug(f"Calling backward on actor {self.actor_id}")
+        self.log.debug(f"Calling backward mb {mb_idx} on actor {self.actor_id}")
+        start = time.perf_counter()
 
         assert inp is not None
 
@@ -224,6 +251,7 @@ class StageActor:
         if truth is not None:
             assert loss_fn is not None
             loss = loss_fn(activation, truth)
+            # print(loss)
             loss.backward()
         # if not the last stage, backprop on the stored activation given 
         # the input gradient from the subsequent stage
@@ -232,11 +260,20 @@ class StageActor:
 
         prev_activations = self.prev_activations[mb_idx]
         if prev_activations:
-            return [act.grad for act in prev_activations]
+            ret = [act.grad for act in prev_activations]
         else:
-            return None
+            ret = None
+        # self.log.info(f"backward actor {self.actor_id} mb {mb_idx}")
+        
+        if self.actor_id != 0:
+            assert ret is not None
+
+        end = time.perf_counter()
+        self.log.debug(f"backward {self.actor_id} took {(end-start)*1000:.2f}ms")
+        return ret
 
     def update(self, *done_mbs):
+        self.log.debug(f"Calling update on actor {self.actor_id}")
         assert self.optim_fn
         for _, optim in self.optims.items():
             optim.step()

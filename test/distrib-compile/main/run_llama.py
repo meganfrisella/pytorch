@@ -1,7 +1,10 @@
 import ray
 import torch
 from torch import nn, optim
-from models.llama import Transformer, LLAMA_DEBUG, LLAMA_1B
+from models.llama import Transformer, LLAMA_DEBUG, LLAMA_1B, LLAMA_3B, LLAMA_8B
+
+ray.init(include_dashboard=False)
+torch.manual_seed(0)
 
 COMPARE_RAY_BASELINE = 0
 
@@ -9,13 +12,24 @@ llama_config = LLAMA_DEBUG
 
 loss_fn = torch.nn.CrossEntropyLoss()
 
+print("loading model")
+
 model = Transformer(llama_config)
+controller_device = 'cuda:0'
+model.to(controller_device)
+
+print("loaded model")
+
 compiled = torch.compile(model, distribute=True)
 
-batch_size = 100
+batch_size = 64
+num_mbs = 4
 seq_len = 32
-x = torch.randint(0, llama_config.vocab_size, (batch_size, seq_len))
-y = torch.zeros((batch_size, llama_config.vocab_size), dtype=torch.long)
+warmup = 3
+iters = 10
+
+x = torch.randint(0, llama_config.vocab_size, (batch_size, seq_len)).to(controller_device)
+y = torch.zeros((batch_size, llama_config.vocab_size), dtype=torch.long).to(controller_device)
 
 # time microbatch schedules
 
@@ -23,14 +37,19 @@ from .llama_schedules import build_1f1b_schedule, build_gpipe_schedule
 from torch._dynamo.scheduling import Task, DAGEdge, execute_schedule
 import time
 
-warmup = 3
-iters = 10
-num_mbs = 4
+print("compiling model")
 
 compiled(x, dynamo_mb=42).get()
 stg1 = compiled._ray_actors[0]
 stg2 = compiled._ray_actors[1]
 
+print("compiled model")
+
+del model.tok_embeddings
+# del model.layers
+del model.norm
+del model.output
+del model.freqs_cis
 
 # "1F1B" schedule
 
@@ -42,9 +61,9 @@ def iter_1f1b_manual():
 
     for mb in range(num_mbs):
         out_ref = compiled(x, dynamo_mb=mb)
-        print(f"Calling backward stage 1 mb {mb}")
+        # print(f"Calling backward stage 1 mb {mb}")
         grad2 = stg2.backward.remote(mb, out_ref.get_ref(), truth=y, loss_fn=loss_fn)
-        print(f"Calling backward stage 0 mb {mb}")
+        # print(f"Calling backward stage 0 mb {mb}")
         grad1 = stg1.backward.remote(mb, grad2)
         done_stg1.append(grad1)
         done_stg2.append(grad2)
@@ -62,7 +81,6 @@ dag_edges = [DAGEdge(0, 1), DAGEdge(1, 2)]
 def iter_1f1b():
     out = execute_schedule(compiled, schedule, dag_edges, [x], y, loss_fn)
     ray.get(out)
-
 
 # warmup
 for _ in range(warmup):
@@ -104,9 +122,9 @@ def iter_gpipe_manual():
         fwd_refs.append(out_ref)
 
     for mb, out_ref in enumerate(fwd_refs):
-        print(f"Calling backward stage 1 mb {mb}")
+        # print(f"Calling backward stage 1 mb {mb}")
         grad2 = stg2.backward.remote(mb, out_ref.get_ref(), truth=y, loss_fn=loss_fn)
-        print(f"Calling backward stage 0 mb {mb}")
+        # print(f"Calling backward stage 0 mb {mb}")
         grad1 = stg1.backward.remote(mb, grad2)
         done_stg1.append(grad1)
         done_stg2.append(grad2)
@@ -157,6 +175,7 @@ print(
 from models.llama_baseline import Transformer as BaseTransformer
 
 baseline = BaseTransformer(llama_config)
+baseline.to('cuda')
 baseline = torch.compile(baseline, distribute=False)
 optim = torch.optim.Adam(baseline.parameters())
 
@@ -183,14 +202,20 @@ print(
     f"Baseline throughput: {(iters * batch_size * seq_len)/(end - start):.0f} tokens/sec"
 )
 
+import time
 
 if COMPARE_RAY_BASELINE:
     # baseline: Ray manual pipeline implementation - 1F1B
 
     from models.llama_actor import LlamaActor
 
-    stg1_actor = LlamaActor.remote(LLAMA_DEBUG, batch_size, seq_len, 0, num_mbs, 2)
-    stg2_actor = LlamaActor.remote(LLAMA_DEBUG, batch_size, seq_len, 1, num_mbs, 2)
+    stg1_actor = LlamaActor.options(num_gpus=1).remote(llama_config, batch_size, seq_len, 0, num_mbs, 2)
+    stg2_actor = LlamaActor.options(num_gpus=1).remote(llama_config, batch_size, seq_len, 1, num_mbs, 2)
+
+    from ray.experimental.collective import create_collective_group
+    create_collective_group(
+        [stg1_actor, stg2_actor], 
+        backend="nccl")
 
     def iter_ray_baseline():
         done_stg1 = []

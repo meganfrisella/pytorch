@@ -517,10 +517,10 @@ class DynamoTLS(threading.local):
     traced_frame_infos: list[str] = []
 
     # Distributed compilation summary for each nn.Module that gets compiled
-    # distributed_compilation_infos: Dict[str, DistributedCompilationInfo] = {}
+    distributed_compilation_infos: Dict[str, DistributedCompilationInfo] = {}
 
     # The name of the forward function that is currently being compiled, if any
-    # currently_compiling: str = None
+    currently_compiling: str = None
 
     # The torch module that is being compiled
     torch_module: OptimizedModule = None
@@ -533,6 +533,9 @@ class DynamoTLS(threading.local):
 
     # The current runtime microbatch
     current_mb = None
+
+    # The nccl group associated with the current compilation
+    current_group = None
 
 dynamo_tls = DynamoTLS()
 

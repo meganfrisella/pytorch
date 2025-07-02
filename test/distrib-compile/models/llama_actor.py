@@ -22,7 +22,7 @@ class LlamaActor:
         num_batches: int,
         num_partitions: int,
     ):
-        self.device = "cpu"
+        self.device = "cuda:0"
 
         self.model_args = model_args
         self.batch_size = batch_size

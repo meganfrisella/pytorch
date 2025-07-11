@@ -31,11 +31,14 @@ class LlamaActor:
         self.num_batches = num_batches
         self.num_partitions = num_partitions
 
+        self.input = None
+        self.truth = None
+
         # manual pipeline
         layers_per_rank = model_args.n_layers // num_partitions
         model_args.n_layers = layers_per_rank
         model = Transformer(model_args)
-        model = torch.compile(model, distribute=False)
+        # model = torch.compile(model, distribute=False)
         if rank == 0:
             model.norm = None
             model.output = None
@@ -58,7 +61,17 @@ class LlamaActor:
         for bparam in self.bparams:
             bparam.logits_as_input = None
             bparam.logits_as_output = None
+        return "done"
 
+    def send_input(self, tensor):
+        self.input = tensor
+        return "done"
+    
+    def send_truth(self, tensor):
+        self.truth = tensor
+        return "done"
+
+    @ray.method(tensor_transport="nccl")
     def forward(
         self, idx: int, logits_as_input: torch.Tensor
     ) -> torch.Tensor:
@@ -67,13 +80,15 @@ class LlamaActor:
         bparam = self.bparams[idx]
 
         if self.rank == 0:
-            logits_as_output = self.model.forward(logits_as_input)
+            assert self.input is not None
+            logits_as_output = self.model.forward(self.input)
             bparam.logits_as_output = logits_as_output
         else:
             logits_as_input = logits_as_input.to(self.device).requires_grad_() # do we need this with nccl transport? 
             bparam.logits_as_input = logits_as_input
             logits_as_output = self.model.forward(logits_as_input)
             bparam.logits_as_output = logits_as_output
+        assert logits_as_output is not None
         return logits_as_output.detach()
 
     def backward_first(self, idx: int, logits: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
@@ -109,20 +124,26 @@ class LlamaActor:
         prev_grad = prev_grad.to(self.device)
 
         bparam.logits_as_output.backward(prev_grad)
+        
+        # return None
+        return prev_grad # return a tensor
 
-        return None
-
-    def backward(self, idx: int, data: torch.Tensor, truth=None) -> Optional[torch.Tensor]:
+    @ray.method(tensor_transport="nccl")
+    def backward(self, idx: int, data: torch.Tensor) -> Optional[torch.Tensor]:
         if self.rank == self.num_partitions - 1:
-            assert truth is not None
-            output = self.backward_first(idx, data, truth)
+            assert self.truth is not None
+            output = self.backward_first(idx, data, self.truth)
         elif self.rank == 0:
             output = self.backward_last(idx, data)
         else:
             output = self.backward_intra(idx, data)
-        return output
+        assert output is not None
+        return output, output
 
-    def update(self, idx, *grads) -> None:
+    @ray.method(tensor_transport="nccl")
+    def update(self, *grads) -> None:
         self.optimizer.step()
         self.optimizer.zero_grad()
-        return "done"
+        # return "done"
+        assert grads[0] is not None
+        return grads[0] # return a tensor

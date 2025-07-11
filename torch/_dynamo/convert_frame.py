@@ -989,12 +989,13 @@ def _compile(
         if fwd_name:
             dynamo_tls.distributed_compilation_infos[fwd_name].add_graph(output)
             if "__resume_at_" not in dis.Bytecode(out_code).dis():
-                log.debug(f"Finished compiling {fwd_name}, traced {dynamo_tls.distributed_compilation_infos[fwd_name].num_graphs()} graphs")
+                log.info(f"Finished compiling {fwd_name}, traced {dynamo_tls.distributed_compilation_infos[fwd_name].num_graphs()} graphs")
                 from ray.experimental.collective import create_collective_group
+                actors = list(dynamo_tls.torch_module._ray_actors.values())
                 create_collective_group(
-                    list(dynamo_tls.torch_module._ray_actors.values()), 
+                    actors,
                     backend="nccl")
-                dynamo_tls.currently_compiling = None
+                # dynamo_tls.currently_compiling = None
 
         return wrap_guarded_code(guarded_code)
 

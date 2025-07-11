@@ -1,6 +1,16 @@
 from torch._dynamo.scheduling import Task, DAGEdge
 
 
+def print_schedule(schedule):
+    for stage in schedule:
+        for step in stage:
+            if step:
+                string = f"{step.mb_idx}:{'f' if step.is_fwd else 'b'}"
+            else:
+                string = " - "
+            print(string, end="\t")
+        print()
+
 def build_gpipe_schedule(n_mubatches: int, num_stages: int):
     steps = n_mubatches + num_stages - 1
     schedule = [[None] * (steps * 2 + 1) for _ in range(num_stages)]

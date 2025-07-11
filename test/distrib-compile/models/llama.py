@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple
 
+import ray
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -118,6 +119,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     t = torch.arange(end, device=freqs.device, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    freqs_cis = torch.ones_like(freqs)
     return freqs_cis
 
 
@@ -430,8 +432,6 @@ class Transformer(nn.Module):
 
         for layer in self.layers[: self.n_layers // 2]:
             h = layer(h, start_pos, freqs_cis, mask)
-
-
 
         torch._dynamo.distributed_stage(1, mb=dynamo_mb, optim=torch.optim.Adam)
 

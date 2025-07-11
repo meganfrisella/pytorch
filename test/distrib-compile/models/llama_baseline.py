@@ -346,11 +346,13 @@ def partition(*args):
 
 
 class Transformer(nn.Module):
-    def __init__(self, params: ModelArgs):
+    def __init__(self, input, params: ModelArgs):
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
+
+        self.input = input
 
         # buckets = [
         #     "VocabParallelEmbedding",
@@ -404,7 +406,9 @@ class Transformer(nn.Module):
             params.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor):
+    def forward(self):
+        tokens = self.input
+        
         seqlen = tokens.shape[1]
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 

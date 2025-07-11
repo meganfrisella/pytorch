@@ -1,6 +1,7 @@
 from enum import Enum
 from typing import NamedTuple
-
+import ray
+from ray.dag import InputNode, MultiOutputNode
 
 class Task(NamedTuple):
     stage_id: int
@@ -15,7 +16,6 @@ class DAGEdge(NamedTuple):
 
 def get_backward_targets(stage_id: int, dag_edges: list[DAGEdge]):
     return [edge for edge in dag_edges if edge.to_stage == stage_id]
-
 
 def execute_schedule(model, schedule, dag_edges: list[DAGEdge], params, truth, loss_fn):
     assert (
@@ -33,10 +33,11 @@ def execute_schedule(model, schedule, dag_edges: list[DAGEdge], params, truth, l
 
     # iterate over evrery task in the schedule
     for i in range(num_steps):
-        for j in range(num_stages):
+        for j in range(num_stages-1, -1, -1):
             task = schedule[j][i]
             if task:
                 stage_id, mb_idx, is_fwd = task
+                assert stage_id == j
                 if is_fwd:
                     # if this is the first forward task for a microbatch, dispatch the forward task
                     # LIMITATION: forward for all stages is dispatched by this call, cannot interleave
@@ -55,9 +56,9 @@ def execute_schedule(model, schedule, dag_edges: list[DAGEdge], params, truth, l
                         bwd_ref_dicts[mb_idx] = dict()
                         bwd_ref_dicts[mb_idx][stage_id] = (
                             actors[stage_id]
-                            .backward.options(num_returns=num_bwd_targets)
+                            .backward.options(num_returns=num_bwd_targets*2)
                             .remote(
-                                mb_idx, fwd_ref.get_ref(), truth=truth, loss_fn=loss_fn
+                                mb_idx, fwd_ref.get_ref(), loss_fn=loss_fn
                             )
                         )
                     else:
@@ -94,16 +95,14 @@ def execute_schedule(model, schedule, dag_edges: list[DAGEdge], params, truth, l
                         # if the subsequent stage's backward had more than one output, index the
                         # list to get the ref for the current stage
                         bwd_refs = bwd_ref_dicts[mb_idx][to_stage]
-                        bwd_ref = (
-                            bwd_refs
-                            if not isinstance(bwd_refs, list)
-                            else bwd_refs[idx]
-                        )
+                        bwd_ref = bwd_refs[idx]
                         # dispatch the current stage's backward and cache the resulting ref(s)
+                        if num_bwd_targets == 0:
+                            num_bwd_targets = 1
                         bwd_ref_dicts[mb_idx][stage_id] = (
                             actors[stage_id]
-                            .backward.options(num_returns=num_bwd_targets)
-                            .remote(mb_idx, bwd_refs)
+                            .backward.options(num_returns=num_bwd_targets*2)
+                            .remote(mb_idx, bwd_ref)
                         )
 
     # add update as the last column in the schedule
@@ -111,9 +110,11 @@ def execute_schedule(model, schedule, dag_edges: list[DAGEdge], params, truth, l
     # TOOD: consider making update explicit in the user-input schedule
     ret = []
     for stage_id in range(num_stages):
+        num_bwd_targets = len(get_backward_targets(stage_id, dag_edges))
         done_refs = []
         for _, bwd_ref_dict in bwd_ref_dicts.items():
             bwd_refs = bwd_ref_dict[stage_id]
+            bwd_refs = bwd_refs[num_bwd_targets:]
             if isinstance(bwd_refs, list):
                 done_refs += bwd_refs
             else:

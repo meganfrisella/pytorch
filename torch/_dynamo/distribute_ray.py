@@ -76,7 +76,7 @@ class RemoteTensor(torch.Tensor):
         return out
     
     def __repr__(self):
-        return f"RayTensor(obj_ref={self.obj_ref})"
+        return f"RemoteTensor(obj_ref={self.obj_ref})"
 
 
 @ray.remote
@@ -92,6 +92,9 @@ class StageActor:
 
         self.actor_id = id
         self.optim_fn = optim_fn
+
+        self.input = None
+        self.truth = None
 
         # ordered list of frame ids for ordering the fx.Graphs on this actor
         self.frame_ids = []
@@ -111,7 +114,15 @@ class StageActor:
 
     def id(self):
         return self.actor_id
+
+    def send_input(self, tensor):
+        self.input = tensor
+        return "done"
     
+    def send_truth(self, tensor):
+        self.truth = tensor
+        return "done"
+
     def compile_graph(self, compile_id: CompileId, gm_data, compiler_fn, example_inputs, parameters):
         self.log.info(f"Compiling graph on actor {self.actor_id}. compile id: {compile_id}. inputs: {len(example_inputs)}")
         start = time.perf_counter()
@@ -165,6 +176,7 @@ class StageActor:
         self.log.debug(f"compile_graph took {(end-start)*1000:.2f}ms")
         return "Finished compiling"
 
+    @ray.method(tensor_transport="nccl")
     def call(self, compile_id: CompileId, mb_idx: int, *args):
         self.log.debug(f"Calling forward {compile_id} mb {mb_idx} on actor {self.actor_id} with {len(args)} args")
         start = time.perf_counter()
@@ -191,6 +203,87 @@ class StageActor:
             if self.actor_id > 0:
                 args[0].requires_grad_()
                 self.prev_activations[mb_idx] = [args[0]]
+            else:
+                self.prev_activations[mb_idx] = []
+            # prev_activations = []
+            # for arg in args:
+            #     print(f"actor: {self.actor_id}, mb: {mb_idx}, inp: {arg.shape}, {arg.requires_grad}")
+            #     if isinstance(arg, torch.Tensor) and arg.requires_grad:
+            #         prev_activations.append(arg)
+            # self.prev_activations[mb_idx] = prev_activations
+            # self.log.info(f"forward actor {self.actor_id} mb {mb_idx} prev_activations: {len(prev_activations)}")
+
+        # patch the args into the stored parameters list, which has None values for the args
+        frame_id = compile_id.frame_id
+        new_args = list(args)
+        parameters = self.parameters[frame_id]
+        args_plus_parameters = []
+
+        # use pre-loaded input for first stage
+        if self.actor_id == 0:
+            assert len(args) == 1
+            args_plus_parameters = parameters
+            args_plus_parameters[0] = self.input
+        else:
+            assert len(new_args) == len([p for p in parameters if p is None])
+            if frame_id in self.parameters:
+                for arg in self.parameters[frame_id]:
+                    if arg is not None:
+                        args_plus_parameters.append(arg)
+                    else:
+                        args_plus_parameters.append(new_args[0])
+                        del new_args[0]
+            else:
+                args_plus_parameters = new_args
+
+        end_args = time.perf_counter()
+
+        start_fx = time.perf_counter()
+        out = self.compiled_fns[compile_id](*args_plus_parameters)
+        end_fx = time.perf_counter()
+
+        # save all outputs which require gradients as the activations
+        if frame_id == self.frame_ids[-1]:
+            # for t in out:
+            #     print(f"out: {t.shape}, {t.requires_grad}")
+            self.activations[mb_idx] = [t for t in out if t.requires_grad]
+
+
+        end = time.perf_counter()
+        self.log.debug(f"forward {self.actor_id} took {(end-start)*1000:.2f}ms")
+        self.log.debug(f"compute took {(end_fx-start_fx)*1000:.2f}ms")
+        self.log.debug(f"processing args took {(end_args-start_args)*1000:.2f}ms")
+        return out
+
+    def call_cpu(self, compile_id: CompileId, mb_idx: int, *args):
+        self.log.debug(f"Calling forward {compile_id} mb {mb_idx} on actor {self.actor_id} with {len(args)} args")
+        start = time.perf_counter()
+
+        start_args = time.perf_counter()
+
+        # Ray object refs resolve to a single element list
+        def unwrap(x):
+            if isinstance(x, list):
+                assert len(x) == 1
+            return x[0] if isinstance(x, list) else x
+        args = list(map(unwrap, args))
+
+        # for arg in args:
+        #     print(f"Input arg: {arg}")
+
+        def send_to_device(param):
+            if isinstance(param, torch.Tensor):
+                return param.to('cuda')
+            else:
+                return param
+        args = list(map(send_to_device, args))
+
+        # save all inputs with gradients as previous activations for backprop
+        frame_id = compile_id.frame_id
+        if frame_id == self.frame_ids[0]:
+            if self.actor_id > 0:
+                args[0].requires_grad_()
+                self.prev_activations[mb_idx] = [args[0]] # TODO: can only backprop on first input tensor
             else:
                 self.prev_activations[mb_idx] = []
             # prev_activations = []
@@ -235,22 +328,29 @@ class StageActor:
         self.log.debug(f"forward {self.actor_id} took {(end-start)*1000:.2f}ms")
         self.log.debug(f"compute took {(end_fx-start_fx)*1000:.2f}ms")
         self.log.debug(f"processing args took {(end_args-start_args)*1000:.2f}ms")
+        assert out is not None
         return out
 
-    def backward(self, mb_idx: int, inp, truth=None, loss_fn=None):
+    @ray.method(tensor_transport="nccl")
+    def backward(self, mb_idx: int, inp, loss_fn=None):
         self.log.debug(f"Calling backward mb {mb_idx} on actor {self.actor_id}")
         start = time.perf_counter()
 
         assert inp is not None
-
+        
+        # if isinstance(inp, list):
+        #     print(f"Calling backward mb {mb_idx} on actor {self.actor_id} with inp {len(inp)}")
+        # else:
+        #     print(f"Calling backward mb {mb_idx} on actor {self.actor_id} with inp {inp.shape}")
+        
         activation = self.activations[mb_idx]
         assert activation is not None and len(activation) == 1
         activation = activation[0]
         # compute loss in the last stage. use the saved activation rather
         # than inp because the saved activation remembers the computation graph
-        if truth is not None:
-            assert loss_fn is not None
-            loss = loss_fn(activation, truth)
+        if loss_fn is not None:
+            assert self.truth is not None
+            loss = loss_fn(activation, self.truth)
             # print(loss)
             loss.backward()
         # if not the last stage, backprop on the stored activation given 
@@ -262,15 +362,14 @@ class StageActor:
         if prev_activations:
             ret = [act.grad for act in prev_activations]
         else:
-            ret = None
-        # self.log.info(f"backward actor {self.actor_id} mb {mb_idx}")
-        
-        if self.actor_id != 0:
-            assert ret is not None
+            assert isinstance(inp, torch.Tensor)
+            ret = [inp]
 
         end = time.perf_counter()
         self.log.debug(f"backward {self.actor_id} took {(end-start)*1000:.2f}ms")
-        return ret
+        assert ret is not None
+        # return two copies of the outputs for tensor transport purposes
+        return ret + ret
 
     def update(self, *done_mbs):
         self.log.debug(f"Calling update on actor {self.actor_id}")
@@ -278,4 +377,5 @@ class StageActor:
         for _, optim in self.optims.items():
             optim.step()
             optim.zero_grad()
+        assert done_mbs[0] is not None
         return "done"

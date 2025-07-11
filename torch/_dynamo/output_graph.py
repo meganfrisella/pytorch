@@ -1782,9 +1782,14 @@ class OutputGraph(OutputGraphGuardsState):
                     def unwrap(x):
                         return x.get_ref() if isinstance(x, RemoteTensor) else x
                     args = list(map(unwrap, args))
-                    # print(f"Calling forward stage {dynamo_tls.current_stage} mb {mb_idx}")
-                    refs = actor.call.options(num_returns=len(fakes)).remote(compile_id, mb_idx, *args)
+                    # print(f"Calling forward stage {dynamo_tls.current_stage} with {args}")
+                    if torch._dynamo.eval_frame.dynamo_tls.currently_compiling:
+                        refs = actor.call_cpu.options(num_returns=len(fakes)).remote(compile_id, mb_idx, *args)
+                    else:
+                        refs = actor.call.options(num_returns=len(fakes)).remote(compile_id, mb_idx, *args)
+                    # print(f"Output refs {refs}")
                     if isinstance(refs, list):
+                        assert len(fakes) == len(refs)
                         return [RemoteTensor(fake, ref) for fake, ref in zip(fakes, refs)]
                     else:
                         assert len(fakes) == 1

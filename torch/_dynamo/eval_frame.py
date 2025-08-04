@@ -334,6 +334,7 @@ class OptimizedModule(torch.nn.Module):
         self._initialize()
         self.training = self._orig_mod.training
         self._ray_actors = dict()
+        self._dag = set()
 
     def _set_optimizer(self, optim_fn):
         self.optim_fn = optim_fn
@@ -524,9 +525,6 @@ class DynamoTLS(threading.local):
 
     # The torch module that is being compiled
     torch_module: OptimizedModule = None
-
-    # The actor associated with the current stage that is being compiled or run
-    current_actor = None
 
     # The id of the current stage
     current_stage = None

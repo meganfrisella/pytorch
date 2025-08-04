@@ -20,7 +20,7 @@ controller_device = 'cuda:0'
 batch_size = 64
 num_mbs = 4
 seq_len = 32
-warmup = 20
+warmup = 10
 iters = 100
 
 x = torch.randint(0, llama_config.vocab_size, (batch_size, seq_len)).to(controller_device)
@@ -29,15 +29,17 @@ y = torch.zeros((batch_size, llama_config.vocab_size), dtype=torch.long).to(cont
 print("loading model")
 
 model = Transformer(llama_config)
+# model = model.half()
 model.to(controller_device)
+
 print("loaded model")
 
 print("compiling model")
 
+from torch._dynamo.backends.debugging import eager
 compiled = torch.compile(model, distribute=True)
 compiled(x, dynamo_mb=42).get()
 torch._dynamo.eval_frame.dynamo_tls.currently_compiling = None
-
 stg1 = compiled._ray_actors[0]
 stg2 = compiled._ray_actors[1]
 
@@ -46,24 +48,12 @@ ray.get(stg2.send_truth.remote(y))
 
 print("compiled model")
 
-del model.tok_embeddings
+# del model.tok_embeddings
 # del model.layers
-del model.norm
-del model.output
-del model.freqs_cis
+# del model.norm
+# del model.output
+# del model.freqs_cis
 
-# microbenchmarking
-# for _ in range(warmup):
-#     ray.wait([compiled(None, dynamo_mb=0).get_ref()], fetch_local=False)
-
-# start = time.perf_counter()
-# for _ in range(iters):
-#     ray.wait([compiled(None, dynamo_mb=0).get_ref()], fetch_local=False)
-# end = time.perf_counter()
-# print(
-#     f"time: {(end - start)*1000000/iters:.0f} us"
-# )
-# exit()
 
 # time microbatch schedules
 
@@ -89,24 +79,24 @@ def iter_1f1b_manual():
 
     upd2 = stg2.update.remote(*done_stg2)
     upd1 = stg1.update.remote(*done_stg1)
-    ray.get([upd2, upd1])
+    ray.get([upd1, upd2])
+    # ray.wait([upd1, upd2], fetch_local=False)
 
 # build high-level schedule
 schedule = build_1f1b_schedule(num_mbs, 2)
-dag_edges = [DAGEdge(0, 1), DAGEdge(1, 2)]
 
 # move bubble to ensure correct scheduling with fused forwards
 schedule[0][2] = schedule[0][1]
 schedule[0][1] = None
 
 def iter_1f1b():
-    out = execute_schedule(compiled, schedule, dag_edges, [None], None, loss_fn)
+    out = execute_schedule(compiled, schedule, [None], None, loss_fn)
     ray.get(out)
-    
+    # ray.wait(out, fetch_local=False)
+
 # warmup
 for _ in range(warmup):
     iter_1f1b()
-    iter_1f1b_manual()
 
 # time
 start = time.perf_counter()
@@ -117,6 +107,14 @@ end = time.perf_counter()
 print(
     f"1F1B execute_schedule throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
 )
+print(
+    f"time: {(end - start)*1000000/iters:.0f} us"
+)
+
+time.sleep(1)
+# warmup
+for _ in range(warmup):
+    iter_1f1b_manual()
 
 # time
 start = time.perf_counter()
@@ -126,6 +124,9 @@ end = time.perf_counter()
 
 print(
     f"1F1B manual schedule throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
+)
+print(
+    f"time: {(end - start)*1000000/iters:.0f} us"
 )
 
 
@@ -149,8 +150,37 @@ def iter_gpipe_manual():
 
     upd2 = stg2.update.remote(*done_stg2)
     upd1 = stg1.update.remote(*done_stg1)
-    ray.wait([upd1, upd2], fetch_local=False)
+    ray.get([upd1, upd2])
+    # ray.wait([upd1, upd2], fetch_local=False)
 
+# build high-level schedule
+schedule = build_gpipe_schedule(num_mbs, 2)
+
+def iter_gpipe():
+    out = execute_schedule(compiled, schedule, [None], None, loss_fn)
+    ray.get(out)
+    # ray.wait(out, fetch_local=False)
+
+print("gpipe auto")
+# warmup
+for _ in range(warmup):
+    iter_gpipe()
+
+# time
+start = time.perf_counter()
+for _ in range(iters):
+    iter_gpipe()
+end = time.perf_counter()
+
+print(
+    f"GPipe execute_schedule throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
+)
+print(
+    f"time: {(end - start)*1000000/iters:.0f} us"
+)
+
+# time.sleep(1)
+print("gpipe manual")
 # warmup
 for _ in range(warmup):
     iter_gpipe_manual()
@@ -168,65 +198,33 @@ print(
     f"time: {(end - start)*1000000/iters:.0f} us"
 )
 
-# build high-level schedule
-schedule = build_gpipe_schedule(num_mbs, 2)
-dag_edges = [DAGEdge(0, 1), DAGEdge(1, 2)]
-
-
-def iter_gpipe():
-    out = execute_schedule(compiled, schedule, dag_edges, [x], y, loss_fn)
-    ray.get(out)
-
-
-# warmup
-for _ in range(warmup):
-    # iter_gpipe()
-    iter_gpipe_manual()
-
-time
-start = time.perf_counter()
-for _ in range(iters):
-    iter_gpipe()
-end = time.perf_counter()
-
-print(
-    f"GPipe execute_schedule throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
-)
-
 
 # baseline: no distribution
 
 from models.llama_baseline import Transformer as BaseTransformer
+from torch._dynamo.backends.debugging import eager
 
 baseline = BaseTransformer(x, llama_config)
+baseline = baseline.half()
 baseline.to('cuda')
 print("loaded model")
-baseline = torch.compile(baseline, distribute=False)
+baseline = torch.compile(baseline, distribute=False, backend=eager)
 optim = torch.optim.Adam(baseline.parameters())
 
-# with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], 
-#     record_shapes=True, 
-#     profile_memory=True,
-#     with_stack=True) as prof:
-#     # warmup
-#     for _ in range(warmup):
-#         baseline(x)
-# prof.export_chrome_trace(f"../../../local_timeline.json")  
-
-# def iter_baseline():
-#     out = baseline(x)
-#     loss = loss_fn(out, y)
-#     loss.backward()
-#     optim.step()
-#     optim.zero_grad()
+def iter_baseline():
+    out = baseline(x)
+    loss = loss_fn(out, y)
+    loss.backward()
+    optim.step()
+    optim.zero_grad()
 
 for _ in range(warmup):
-    baseline()
+    iter_baseline()
 
 # time
 start = time.perf_counter()
 for _ in range(iters):
-    baseline()
+    iter_baseline()
 end = time.perf_counter()
 
 print(
@@ -257,19 +255,6 @@ if COMPARE_RAY_BASELINE:
         out2 = stg2_actor.forward.remote(0, out1)
         ray.get(out2)
 
-    # for batch_size in [512]:
-    #     x = torch.randint(0, llama_config.vocab_size, (batch_size, seq_len)).to(controller_device)
-    #     ray.get(stg1_actor.send_input.remote(x))
-    #     start = time.perf_counter()
-    #     for _ in range(iters):
-    #         out1 = stg1_actor.forward.remote(0, None)
-    #         out2 = stg2_actor.forward.remote(0, out1)
-    #         ray.get(out2)
-    #     end = time.perf_counter()
-    #     print(
-    #         f"{batch_size}: {(end - start)*1000000/iters:.0f} us"
-    #     )
-    # exit()
 
 
     def iter_ray_baseline():

@@ -1759,8 +1759,8 @@ class OutputGraph(OutputGraphGuardsState):
                 self.override_graphargs = new_graphargs
 
                 # instantiate a Ray actor and send the fx.Graph to get compiled
-                assert dynamo_tls.current_actor
-                actor = dynamo_tls.current_actor
+                stage_id = dynamo_tls.current_stage
+                actor = dynamo_tls.torch_module._ray_actors[stage_id]
                 compile_id = self.better_compile_id
                 ray.get(
                     actor.compile_graph.remote(
@@ -1772,28 +1772,38 @@ class OutputGraph(OutputGraphGuardsState):
                     )
                 )
 
-                fakes = get_fake_tensors(example_inputs, gm)
+                # fakes = get_fake_tensors(example_inputs, gm)
+                def symint_to_tensor(x):
+                    return torch.tensor(x) if not isinstance(x, FakeTensor) else x
+                fakes = list(map(symint_to_tensor, get_fake_tensors(example_inputs, gm)))
 
                 # the returned function makes a remote call to the compiled fx.Graph
                 # return the resulting Ray ObjectRef as a RemoteTensor, which additionally
                 # requires the fx.Graph and example inputs to compute the RemoteTensor shape
                 def overwrite_compiled_fn(*args):
-                    mb_idx = torch._dynamo.eval_frame.dynamo_tls.current_mb
+                    # track stage dependencies
+                    for arg in args:
+                        if isinstance(arg, RemoteTensor):
+                            torch._dynamo.eval_frame.dynamo_tls.torch_module._dag.add((arg.get_stage_id(), stage_id))
+
+                    # get Ray ObjectRefs from RemoteTensors
                     def unwrap(x):
                         return x.get_ref() if isinstance(x, RemoteTensor) else x
                     args = list(map(unwrap, args))
-                    # print(f"Calling forward stage {dynamo_tls.current_stage} with {args}")
+
+                    mb_idx = torch._dynamo.eval_frame.dynamo_tls.current_mb
                     if torch._dynamo.eval_frame.dynamo_tls.currently_compiling:
+                        # dispatch task without nccl transport
                         refs = actor.call_cpu.options(num_returns=len(fakes)).remote(compile_id, mb_idx, *args)
                     else:
                         refs = actor.call.options(num_returns=len(fakes)).remote(compile_id, mb_idx, *args)
-                    # print(f"Output refs {refs}")
+
                     if isinstance(refs, list):
                         assert len(fakes) == len(refs)
-                        return [RemoteTensor(fake, ref) for fake, ref in zip(fakes, refs)]
+                        return [RemoteTensor(fake, ref, stage_id) for fake, ref in zip(fakes, refs)]
                     else:
                         assert len(fakes) == 1
-                        return [RemoteTensor(fakes[0], refs)]
+                        return [RemoteTensor(fakes[0], refs, stage_id)]
 
                 compiled_fn = overwrite_compiled_fn
             else:

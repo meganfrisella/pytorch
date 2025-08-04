@@ -34,10 +34,12 @@ def get_fake_tensors(example_inputs, graph_module: fx.GraphModule):
 
 class RemoteTensor(torch.Tensor):
     _fake: torch.Tensor
+    _stage_id: int
 
     def __new__(cls, 
-                fake: list[FakeTensor], 
-                obj_ref: ray._raylet.ObjectRef):
+                fake: FakeTensor, 
+                obj_ref: ray._raylet.ObjectRef,
+                stage_id: int):
         instance = torch.Tensor._make_wrapper_subclass(
             cls,
             fake.size(),
@@ -49,10 +51,14 @@ class RemoteTensor(torch.Tensor):
             requires_grad=fake.requires_grad,
         )
         instance.obj_ref = obj_ref
+        instance._stage_id = stage_id
         instance.resolved = None
         instance._fake = fake
         instance.key = RemoteTensorKey()
         return instance
+
+    def get_stage_id(self):
+        return self._stage_id
 
     def get(self):
         if self.resolved is None:
@@ -116,11 +122,11 @@ class StageActor:
         return self.actor_id
 
     def send_input(self, tensor):
-        self.input = tensor
+        self.input = tensor.to('cuda')
         return "done"
     
     def send_truth(self, tensor):
-        self.truth = tensor
+        self.truth = tensor.to('cuda')
         return "done"
 
     def compile_graph(self, compile_id: CompileId, gm_data, compiler_fn, example_inputs, parameters):
@@ -153,7 +159,7 @@ class StageActor:
         else:
             def send_to_device(param):
                 if isinstance(param, torch.Tensor):
-                    return param.to('cuda')
+                    return param.to('cuda').detach().requires_grad_()
                 else:
                     return param
             parameters = list(map(send_to_device, parameters))
@@ -167,8 +173,8 @@ class StageActor:
         if frame_id not in self.frame_ids:
             self.frame_ids.append(frame_id)
 
-        self.gm = torch.load(gm_data, weights_only=False)
-        compiled_fn = compiler_fn(self.gm, example_inputs)
+        gm = torch.load(gm_data, weights_only=False)
+        compiled_fn = compiler_fn(gm, example_inputs)
         assert callable(compiled_fn), "compiler_fn did not return callable"
         self.compiled_fns[compile_id] = compiled_fn
 
@@ -179,15 +185,11 @@ class StageActor:
     @ray.method(tensor_transport="nccl")
     def call(self, compile_id: CompileId, mb_idx: int, *args):
         self.log.debug(f"Calling forward {compile_id} mb {mb_idx} on actor {self.actor_id} with {len(args)} args")
-        start = time.perf_counter()
-
-        start_args = time.perf_counter()
-
         # Ray object refs resolve to a single element list
         def unwrap(x):
-            if isinstance(x, list):
+            if isinstance(x, list) or isinstance(x, tuple):
                 assert len(x) == 1
-            return x[0] if isinstance(x, list) else x
+            return x[0] if isinstance(x, list) or isinstance(x, tuple) else x
         args = list(map(unwrap, args))
 
         def send_to_device(param):
@@ -197,102 +199,24 @@ class StageActor:
                 return param
         args = list(map(send_to_device, args))
 
-        # save all inputs with gradients as previous activations for backprop
-        frame_id = compile_id.frame_id
-        if frame_id == self.frame_ids[0]:
-            if self.actor_id > 0:
-                args[0].requires_grad_()
-                self.prev_activations[mb_idx] = [args[0]]
-            else:
-                self.prev_activations[mb_idx] = []
-            # prev_activations = []
-            # for arg in args:
-            #     print(f"actor: {self.actor_id}, mb: {mb_idx}, inp: {arg.shape}, {arg.requires_grad}")
-            #     if isinstance(arg, torch.Tensor) and arg.requires_grad:
-            #         prev_activations.append(arg)
-            # self.prev_activations[mb_idx] = prev_activations
-            # self.log.info(f"forward actor {self.actor_id} mb {mb_idx} prev_activations: {len(prev_activations)}")
-
-        # patch the args into the stored parameters list, which has None values for the args
-        frame_id = compile_id.frame_id
-        new_args = list(args)
-        parameters = self.parameters[frame_id]
-        args_plus_parameters = []
-
-        # use pre-loaded input for first stage
-        if self.actor_id == 0:
-            assert len(args) == 1
-            args_plus_parameters = parameters
-            args_plus_parameters[0] = self.input
-        else:
-            assert len(new_args) == len([p for p in parameters if p is None])
-            if frame_id in self.parameters:
-                for arg in self.parameters[frame_id]:
-                    if arg is not None:
-                        args_plus_parameters.append(arg)
-                    else:
-                        args_plus_parameters.append(new_args[0])
-                        del new_args[0]
-            else:
-                args_plus_parameters = new_args
-
-        end_args = time.perf_counter()
-
-        start_fx = time.perf_counter()
-        out = self.compiled_fns[compile_id](*args_plus_parameters)
-        end_fx = time.perf_counter()
-
-        # save all outputs which require gradients as the activations
-        if frame_id == self.frame_ids[-1]:
-            # for t in out:
-            #     print(f"out: {t.shape}, {t.requires_grad}")
-            self.activations[mb_idx] = [t for t in out if t.requires_grad]
-
-
-        end = time.perf_counter()
-        self.log.debug(f"forward {self.actor_id} took {(end-start)*1000:.2f}ms")
-        self.log.debug(f"compute took {(end_fx-start_fx)*1000:.2f}ms")
-        self.log.debug(f"processing args took {(end_args-start_args)*1000:.2f}ms")
-        return out
-
-    def call_cpu(self, compile_id: CompileId, mb_idx: int, *args):
-        self.log.debug(f"Calling forward {compile_id} mb {mb_idx} on actor {self.actor_id} with {len(args)} args")
-        start = time.perf_counter()
-
-        start_args = time.perf_counter()
-
-        # Ray object refs resolve to a single element list
-        def unwrap(x):
-            if isinstance(x, list):
-                assert len(x) == 1
-            return x[0] if isinstance(x, list) else x
-        args = list(map(unwrap, args))
-
-        # for arg in args:
-        #     print(f"Input arg: {arg}")
-
-        def send_to_device(param):
-            if isinstance(param, torch.Tensor):
-                return param.to('cuda')
+        def pre_loaded_input(param):
+            if param is None:
+                return self.input
             else:
                 return param
-        args = list(map(send_to_device, args))
+        args = list(map(pre_loaded_input, args))
 
         # save all inputs with gradients as previous activations for backprop
         frame_id = compile_id.frame_id
         if frame_id == self.frame_ids[0]:
-            if self.actor_id > 0:
-                args[0].requires_grad_()
-                self.prev_activations[mb_idx] = [args[0]] # TODO: can only backprop on first input tensor
-            else:
-                self.prev_activations[mb_idx] = []
-            # prev_activations = []
-            # for arg in args:
-            #     print(f"actor: {self.actor_id}, mb: {mb_idx}, inp: {arg.shape}, {arg.requires_grad}")
-            #     if isinstance(arg, torch.Tensor) and arg.requires_grad:
-            #         prev_activations.append(arg)
-            # self.prev_activations[mb_idx] = prev_activations
-            # self.log.info(f"forward actor {self.actor_id} mb {mb_idx} prev_activations: {len(prev_activations)}")
+            activation_idxs = self.prev_activation_idxs
+            prev_activations = []
+            for idx, arg in enumerate(args):
+                if idx in activation_idxs:
+                    if not isinstance(arg, torch.Tensor):
+                        print(arg)
+                    prev_activations.append(arg.requires_grad_())
+            self.prev_activations[mb_idx] = prev_activations
 
         # patch the args into the stored parameters list, which has None values for the args
         frame_id = compile_id.frame_id
@@ -311,64 +235,104 @@ class StageActor:
         else:
             args_plus_parameters = new_args
 
-        end_args = time.perf_counter()
 
-        start_fx = time.perf_counter()
         out = self.compiled_fns[compile_id](*args_plus_parameters)
-        end_fx = time.perf_counter()
 
         # save all outputs which require gradients as the activations
         if frame_id == self.frame_ids[-1]:
-            # for t in out:
-            #     print(f"out: {t.shape}, {t.requires_grad}")
             self.activations[mb_idx] = [t for t in out if t.requires_grad]
 
+        return out
 
-        end = time.perf_counter()
-        self.log.debug(f"forward {self.actor_id} took {(end-start)*1000:.2f}ms")
-        self.log.debug(f"compute took {(end_fx-start_fx)*1000:.2f}ms")
-        self.log.debug(f"processing args took {(end_args-start_args)*1000:.2f}ms")
-        assert out is not None
+    def call_cpu(self, compile_id: CompileId, mb_idx: int, *args):
+        self.log.debug(f"Calling cpu forward {compile_id} mb {mb_idx} on actor {self.actor_id} with {len(args)} args")
+
+        def send_to_device(param):
+            if isinstance(param, torch.Tensor):
+                return param.to('cuda')
+            else:
+                return param
+        args = list(map(send_to_device, args))
+
+        def pre_loaded_input(param):
+            if param is None:
+                return self.input
+            else:
+                return param
+        args = list(map(pre_loaded_input, args))
+
+        # Ray object refs resolve to a single element list
+        def unwrap(x):
+            if isinstance(x, list) or isinstance(x, tuple):
+                assert len(x) == 1
+                return x[0]
+            else:
+                return x
+        args = list(map(unwrap, args))
+
+        # save all inputs with gradients as previous activations for backprop
+        frame_id = compile_id.frame_id
+        if frame_id == self.frame_ids[0]:
+            activation_idxs = []
+            prev_activations = []
+            for idx, arg in enumerate(args):
+                if isinstance(arg, torch.Tensor) and arg.requires_grad:
+                    prev_activations.append(arg)
+                    activation_idxs.append(idx)
+            self.prev_activations[mb_idx] = prev_activations
+            self.prev_activation_idxs = activation_idxs
+
+        # patch the args into the stored parameters list, which has None values for the args
+        frame_id = compile_id.frame_id
+        new_args = list(args)
+        parameters = self.parameters[frame_id]
+        args_plus_parameters = []
+
+        assert len(new_args) == len([p for p in parameters if p is None])
+        if frame_id in self.parameters:
+            for arg in self.parameters[frame_id]:
+                if arg is not None:
+                    args_plus_parameters.append(arg)
+                else:
+                    args_plus_parameters.append(new_args[0])
+                    del new_args[0]
+        else:
+            args_plus_parameters = new_args
+
+
+        out = self.compiled_fns[compile_id](*args_plus_parameters)
+
+        # save all outputs which require gradients as the activations
+        if frame_id == self.frame_ids[-1]:
+            self.activations[mb_idx] = [t for t in out if t.requires_grad]
+
         return out
 
     @ray.method(tensor_transport="nccl")
     def backward(self, mb_idx: int, inp, loss_fn=None):
         self.log.debug(f"Calling backward mb {mb_idx} on actor {self.actor_id}")
-        start = time.perf_counter()
-
-        assert inp is not None
-        
-        # if isinstance(inp, list):
-        #     print(f"Calling backward mb {mb_idx} on actor {self.actor_id} with inp {len(inp)}")
-        # else:
-        #     print(f"Calling backward mb {mb_idx} on actor {self.actor_id} with inp {inp.shape}")
-        
         activation = self.activations[mb_idx]
-        assert activation is not None and len(activation) == 1
+        assert activation is not None
         activation = activation[0]
         # compute loss in the last stage. use the saved activation rather
         # than inp because the saved activation remembers the computation graph
         if loss_fn is not None:
             assert self.truth is not None
             loss = loss_fn(activation, self.truth)
-            # print(loss)
             loss.backward()
         # if not the last stage, backprop on the stored activation given 
         # the input gradient from the subsequent stage
         else:
+            assert inp is not None
+            assert activation.shape == inp.shape
             activation.backward(gradient=inp)
 
         prev_activations = self.prev_activations[mb_idx]
         if prev_activations:
             ret = [act.grad for act in prev_activations]
         else:
-            assert isinstance(inp, torch.Tensor)
-            ret = [inp]
+            ret = ["done"]
 
-        end = time.perf_counter()
-        self.log.debug(f"backward {self.actor_id} took {(end-start)*1000:.2f}ms")
-        assert ret is not None
-        # return two copies of the outputs for tensor transport purposes
         return ret + ret
 
     def update(self, *done_mbs):
@@ -377,5 +341,4 @@ class StageActor:
         for _, optim in self.optims.items():
             optim.step()
             optim.zero_grad()
-        assert done_mbs[0] is not None
         return "done"

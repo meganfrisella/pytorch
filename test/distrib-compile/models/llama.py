@@ -414,7 +414,7 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
         start_pos = 0
-        freqs_cis = self.freqs_cis.to(h.device)[start_pos : start_pos + seqlen]
+        freqs_cis = self.freqs_cis.to(h.device)[start_pos : start_pos + seqlen].detach()
 
         mask = None
         if seqlen > 1:
@@ -435,7 +435,7 @@ class Transformer(nn.Module):
 
         torch._dynamo.distributed_stage(1, mb=dynamo_mb, optim=torch.optim.Adam)
 
-        for layer in self.layers[self.n_layers // 2 :]:
+        for layer in self.layers[self.n_layers // 2:]:
             h = layer(h, start_pos, freqs_cis, mask)
 
         h = self.norm(h) if self.norm else h

@@ -17,13 +17,15 @@ class DAGEdge(NamedTuple):
 def get_backward_targets(stage_id: int, dag_edges: list[DAGEdge]):
     return [edge for edge in dag_edges if edge.to_stage == stage_id]
 
-def execute_schedule(model, schedule, dag_edges: list[DAGEdge], params, truth, loss_fn):
+def execute_schedule(model, schedule, params, truth, loss_fn):
     assert (
         hasattr(model, "_ray_actors")
         and "model must be compiled with torch.compile with flag distribute=True"
     )
-    actors = model._ray_actors
     num_steps, num_stages = len(schedule[0]), len(schedule)
+    actors = model._ray_actors
+    dag_edges = model._dag
+    dag_edges = list(map(lambda e: (DAGEdge(e[0], e[1])), list(model._dag)))
 
     # maps mb_idx to the ref resulting from a forward call on the microbatch
     fwd_refs = dict()
@@ -43,6 +45,7 @@ def execute_schedule(model, schedule, dag_edges: list[DAGEdge], params, truth, l
                     # LIMITATION: forward for all stages is dispatched by this call, cannot interleave
                     # forward tasks with other tasks.
                     if mb_idx not in fwd_refs:
+                        # print(f"Fwd mb {mb_idx}")
                         fwd_refs[mb_idx] = model(*params, dynamo_mb=mb_idx)
                 else:
                     # log order of task dispatch by printing
@@ -54,6 +57,7 @@ def execute_schedule(model, schedule, dag_edges: list[DAGEdge], params, truth, l
                         # backward task and cache the resulting ref(s)
                         fwd_ref = fwd_refs[mb_idx]
                         bwd_ref_dicts[mb_idx] = dict()
+                        # print(f"Bwd {stage_id}:{mb_idx}")
                         bwd_ref_dicts[mb_idx][stage_id] = (
                             actors[stage_id]
                             .backward.options(num_returns=num_bwd_targets*2)
@@ -99,6 +103,7 @@ def execute_schedule(model, schedule, dag_edges: list[DAGEdge], params, truth, l
                         # dispatch the current stage's backward and cache the resulting ref(s)
                         if num_bwd_targets == 0:
                             num_bwd_targets = 1
+                        # print(f"Bwd {stage_id}:{mb_idx}")
                         bwd_ref_dicts[mb_idx][stage_id] = (
                             actors[stage_id]
                             .backward.options(num_returns=num_bwd_targets*2)
@@ -111,83 +116,18 @@ def execute_schedule(model, schedule, dag_edges: list[DAGEdge], params, truth, l
     ret = []
     for stage_id in range(num_stages):
         num_bwd_targets = len(get_backward_targets(stage_id, dag_edges))
-        done_refs = []
+        if num_bwd_targets == 0:
+            num_bwd_targets = 1
+        # print(stage_id, dag_edges, num_bwd_targets)
+        done_refs = set()
         for _, bwd_ref_dict in bwd_ref_dicts.items():
             bwd_refs = bwd_ref_dict[stage_id]
             bwd_refs = bwd_refs[num_bwd_targets:]
             if isinstance(bwd_refs, list):
-                done_refs += bwd_refs
+                done_refs = done_refs | set(bwd_refs)
             else:
-                done_refs.append(bwd_refs)
+                done_refs.add(bwd_refs)
+        done_refs = list(done_refs)
         upd = actors[stage_id].update.remote(*done_refs)
         ret.append(upd)
     return ret
-
-
-# IGNORE the code below
-# we shouldn't need to worry about schedule traversal order
-
-# def execute_schedule_backwards(model, schedule, dag_edges: list[DAGEdge], params, truth, loss_fn):
-#     assert (
-#         hasattr(model, "_ray_actors")
-#         and "model must be compiled with torch.compile with flag distribute=True"
-#     )
-#     actors = model._ray_actors
-#     num_steps, num_stages = len(schedule[0]), len(schedule)
-#     fwd_refs = dict()
-#     bwd_ref_dicts = dict()
-#     for i in range(num_steps):
-#         for j in reversed(range(num_stages)):
-#             task = schedule[j][i]
-#             if task:
-#                 stage_id, mb_idx, is_fwd = task
-#                 if is_fwd:
-#                     if mb_idx not in fwd_refs:
-#                         fwd_refs[mb_idx] = model(*params, dynamo_mb=mb_idx)
-#                 else:
-#                     print(f"Calling backward stage {stage_id} mb {mb_idx}")
-#                     num_bwd_targets = len(get_backward_targets(stage_id, dag_edges))
-#                     if mb_idx not in bwd_ref_dicts:
-#                         fwd_ref = fwd_refs[mb_idx]
-#                         bwd_ref_dicts[mb_idx] = dict()
-#                         bwd_ref_dicts[mb_idx][stage_id] = (
-#                             actors[stage_id]
-#                             .backward.options(num_returns=num_bwd_targets)
-#                             .remote(
-#                                 mb_idx, fwd_ref.get_ref(), truth=truth, loss_fn=loss_fn
-#                             )
-#                         )
-#                     else:
-#                         to_stage = [
-#                             edge.to_stage
-#                             for edge in dag_edges
-#                             if edge.from_stage == stage_id
-#                         ]
-#                         assert len(to_stage) == 1
-#                         to_stage = to_stage[0]
-#                         targets = get_backward_targets(to_stage, dag_edges)
-#                         idx = targets.index(DAGEdge(stage_id, to_stage))
-#                         assert to_stage in bwd_ref_dicts[mb_idx]
-#                         bwd_refs = bwd_ref_dicts[mb_idx][to_stage]
-#                         bwd_ref = (
-#                             bwd_refs
-#                             if not isinstance(bwd_refs, list)
-#                             else bwd_refs[idx]
-#                         )
-#                         bwd_ref_dicts[mb_idx][stage_id] = (
-#                             actors[stage_id]
-#                             .backward.options(num_returns=num_bwd_targets)
-#                             .remote(mb_idx, bwd_refs)
-#                         )
-#     ret = []
-#     for stage_id in range(num_stages):
-#         done_refs = []
-#         for _, bwd_ref_dict in bwd_ref_dicts.items():
-#             bwd_refs = bwd_ref_dict[stage_id]
-#             if isinstance(bwd_refs, list):
-#                 done_refs += bwd_refs
-#             else:
-#                 done_refs.append(bwd_refs)
-#         upd = actors[stage_id].update.remote(*done_refs)
-#         ret.append(upd)
-#     return ret

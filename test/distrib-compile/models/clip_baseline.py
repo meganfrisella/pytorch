@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-
+import time
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -431,14 +431,24 @@ class CLIP(nn.Module):
         return x
 
     def forward(self, image, text, dynamo_mb: int=0):
+        # time.sleep(1)
+
+
         image_features = self.encode_image(image)
         # normalize features
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
 
 
+        # time.sleep(1)
+
+
         text_features = self.encode_text(text)
         # normalize features
         text_features = text_features / text_features.norm(dim=1, keepdim=True)
+
+
+        # time.sleep(1)
+
 
         # cosine similarity as logits
         logit_scale = self.logit_scale.exp()

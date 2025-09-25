@@ -2,8 +2,14 @@ import torch
 from torch import nn, einsum
 import torch.nn.functional as F
 
+import einops
 from einops import rearrange, repeat
 from einops_exts import rearrange_many, repeat_many
+
+# torch._dynamo.disallow_in_graph(rearrange)
+# torch._dynamo.disallow_in_graph(repeat)
+# torch._dynamo.disallow_in_graph(einops.reduce)
+# torch._dynamo.disallow_in_graph(torch.unsqueeze)
 
 def exists(val):
     return val is not None
@@ -209,7 +215,6 @@ class GatedCrossAttentionBlock(nn.Module):
         x = self.ff(x) * self.ff_gate.tanh()  + x
         return x
 
-
 # helper functions
 
 def exists(val):
@@ -269,6 +274,7 @@ class RotaryEmbedding(nn.Module):
     def forward(self, max_seq_len, *, device):
         seq = torch.arange(max_seq_len, device=device, dtype=self.inv_freq.dtype)
         freqs = einsum("i , j -> i j", seq, self.inv_freq)
+        # freqs = torch.outer(seq, self.inv_freq)
         return torch.cat((freqs, freqs), dim=-1)
 
 
@@ -451,18 +457,17 @@ class FlamingoPaLM(nn.Module):
         # they used embedding weight tied projection out to logits, not common, but works
         self.to_logits[-1].weight = self.token_emb.weight
         nn.init.normal_(self.token_emb.weight, std=0.02)
-
+    
     def forward(
         self,
         text,
         *,
         images=None,
         videos=None,
-        embeds=None
+        embeds=None,
+        dynamo_mb=0,
     ):
-        # free variables in stage1:
-        #   self, text, images, videos, embeds
-        # with new_stage():
+        torch._dynamo.distributed_stage(0, mb=dynamo_mb, optim=torch.optim.Adam)
 
         batch, device = text.shape[0], text.device
 
@@ -485,15 +490,14 @@ class FlamingoPaLM(nn.Module):
 
         text_tokens = self.token_emb(text)
 
-        assert not (exists(embeds) and (exists(images) or exists(video)))   
-
-        # free variables in stage2:
-        #   self, images, videos, batch
-        # with new_stage():
+        assert not (exists(embeds) and (exists(images) or exists(video)))
 
         # encode videos or images into embeddings
         # with the img_encoder passed in at init
         # it can also accept precomputed image embeddings
+
+        torch._dynamo.distributed_stage(1, mb=dynamo_mb, optim=torch.optim.Adam)
+
         if exists(images):
             assert exists(self.img_encoder), 'img_encoder must be passed in for automatic image encoding'
             images = rearrange(images, 'b t ... -> (b t) ...')
@@ -517,20 +521,16 @@ class FlamingoPaLM(nn.Module):
             embeds = embeds + video_time_pos_emb
             embeds = rearrange(embeds, 'b m t n d -> b m (t n) d')
 
-        # free variables in stage3:
-        #   self, embeds
-        # with new_stage():
-
         if exists(embeds):
             embeds = self.perceiver_resampler(embeds)
 
-        # free variables in stage4:
-        #   self, text_tokens, embeds, media_locations
-        # with new_stage():
-        
+        torch._dynamo.distributed_stage(2, mb=dynamo_mb, optim=torch.optim.Adam)
+
         # go through layers
+
         for attn_ff, flamingo_cross_attn in self.layers:
             text_tokens = attn_ff(text_tokens)
+
             # if image embeds exist and flamingo cross attention set for the layer
             # do the cross attention
             if exists(flamingo_cross_attn) and exists(embeds):
@@ -539,4 +539,5 @@ class FlamingoPaLM(nn.Module):
                     embeds,
                     media_locations = media_locations
                 )
+
         return self.to_logits(text_tokens)

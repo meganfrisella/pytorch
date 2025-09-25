@@ -43,7 +43,7 @@ class ModelArgs:
 
 LLAMA_DEBUG = ModelArgs(
     dim=512,
-    n_layers=4,
+    n_layers=8,
     n_heads=32,
     n_kv_heads=8,
     vocab_size=512,  # 128256,
@@ -408,7 +408,7 @@ class Transformer(nn.Module):
 
     def forward(self, tokens: torch.Tensor, dynamo_mb: int=0):
 
-        torch._dynamo.distributed_stage(0, mb=dynamo_mb, optim=torch.optim.Adam)
+        torch._dynamo.distributed_stage(0, actor_id=0, mb=dynamo_mb, optim=torch.optim.Adam)
 
         seqlen = tokens.shape[1]
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
@@ -430,12 +430,60 @@ class Transformer(nn.Module):
                 [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
             ).type_as(h)
 
-        for layer in self.layers[: self.n_layers // 2]:
+        for layer in self.layers[:14]:
             h = layer(h, start_pos, freqs_cis, mask)
 
-        torch._dynamo.distributed_stage(1, mb=dynamo_mb, optim=torch.optim.Adam)
+        # torch._dynamo.distributed_stage(1, actor_id=1, mb=dynamo_mb, optim=torch.optim.Adam)
 
-        for layer in self.layers[self.n_layers // 2:]:
+        # for layer in self.layers[7:14]:
+        #     h = layer(h, start_pos, freqs_cis, mask)
+        
+        # freqs_cis = freqs_cis * 1
+        # mask = mask * 1
+
+        # torch._dynamo.distributed_stage(2, actor_id=0, mb=dynamo_mb, optim=torch.optim.Adam)
+
+        # for layer in self.layers[14:21]:
+        #     h = layer(h, start_pos, freqs_cis, mask)
+        
+        # freqs_cis = freqs_cis * 1
+        # mask = mask * 1
+
+        # torch._dynamo.distributed_stage(3, actor_id=3, mb=dynamo_mb, optim=torch.optim.Adam)
+
+        # for layer in self.layers[9:12]:
+        #     h = layer(h, start_pos, freqs_cis, mask)
+        
+        # freqs_cis = freqs_cis * 1
+        # mask = mask * 1
+
+        # torch._dynamo.distributed_stage(4, actor_id=0, mb=dynamo_mb, optim=torch.optim.Adam)
+
+        # for layer in self.layers[12:16]:
+        #     h = layer(h, start_pos, freqs_cis, mask)
+        
+        # freqs_cis = freqs_cis * 1
+        # mask = mask * 1
+
+        # torch._dynamo.distributed_stage(5, actor_id=1, mb=dynamo_mb, optim=torch.optim.Adam)
+
+        # for layer in self.layers[16:20]:
+        #     h = layer(h, start_pos, freqs_cis, mask)
+        
+        # freqs_cis = freqs_cis * 1
+        # mask = mask * 1
+
+        # torch._dynamo.distributed_stage(6, actor_id=2, mb=dynamo_mb, optim=torch.optim.Adam)
+
+        # for layer in self.layers[20:24]:
+        #     h = layer(h, start_pos, freqs_cis, mask)
+
+        # freqs_cis = freqs_cis * 1
+        # mask = mask * 1
+
+        torch._dynamo.distributed_stage(1, actor_id=1, mb=dynamo_mb, optim=torch.optim.Adam)
+
+        for layer in self.layers[14:]:
             h = layer(h, start_pos, freqs_cis, mask)
 
         h = self.norm(h) if self.norm else h

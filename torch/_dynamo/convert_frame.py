@@ -185,6 +185,8 @@ class Tracker:
     def __init__(self) -> None:
         self.seen: list[ReferenceType[CodeType]] = []
         self.seen_ids: set[int] = set()
+        self.piper_fns: dict = dict()
+        self.name_map: dict = dict()
 
     def add(self, strong_obj: CodeType) -> None:
         idx = id(strong_obj)
@@ -193,12 +195,19 @@ class Tracker:
             self.seen.append(obj)
             self.seen_ids.add(idx)
 
+    def add_piper(self, name, fn):
+        self.piper_fns[name] = fn
+    
+    def map_name(self, key, val):
+        self.name_map[key] = val
+
     def __contains__(self, item: CodeType) -> bool:
         return id(item) in self.seen_ids
 
     def clear(self) -> None:
         self.seen.clear()
         self.seen_ids.clear()
+        self.name_map.clear()
 
 
 input_codes = Tracker()
@@ -904,6 +913,20 @@ def _compile(
 
         orig_code_map[out_code] = code
         output_codes.add(out_code)
+        # log.info("Adding output code %s", code.co_name)
+        import types
+        if code.co_name in output_codes.name_map:
+            name = output_codes.name_map[code.co_name]
+            output_codes.add_piper(name, types.FunctionType(out_code, globals, name))
+            # mark fn name if this is the beginning of a new stage
+            # current_stage = dynamo_tls.current_stage
+            # if not dynamo_tls.stage_fns[current_stage]:
+            #     dynamo_tls.stage_fns[current_stage] = name
+        if code.co_name == "forward":
+            output_codes.add_piper(code.co_name, types.FunctionType(out_code, globals, code.co_name))
+        # CONT_REGISTRY = torch._dynamo.symbolic_convert.CONT_REGISTRY
+        # if code.co_name == "forward" and "forward" not in CONT_REGISTRY:
+        #     CONT_REGISTRY[code.co_name] = types.FunctionType(out_code, globals, code.co_name)
         dynamo_time_before_restart = last_attempt_start_time - start_time
         assert output is not None
 
@@ -990,12 +1013,6 @@ def _compile(
             dynamo_tls.distributed_compilation_infos[fwd_name].add_graph(output)
             if "__resume_at_" not in dis.Bytecode(out_code).dis():
                 log.info(f"Finished compiling {fwd_name}, traced {dynamo_tls.distributed_compilation_infos[fwd_name].num_graphs()} graphs")
-                from ray.experimental.collective import create_collective_group
-                actors = list(dynamo_tls.torch_module._ray_actors.values())
-                create_collective_group(
-                    actors,
-                    backend="nccl")
-                # dynamo_tls.currently_compiling = None
 
         return wrap_guarded_code(guarded_code)
 
@@ -1031,7 +1048,8 @@ def _compile(
             )
         metrics_context.update_outer({"recompile_reason": recompile_reason})
 
-        exceeded, limit_type = exceeds_recompile_limit(cache_size, compile_id)
+        # exceeded, limit_type = exceeds_recompile_limit(cache_size, compile_id)
+        exceeded = False
         if exceeded:
 
             def format_func_info(code: CodeType) -> str:
@@ -1145,6 +1163,8 @@ def _compile(
             # extra graph break compilations.)
             put_code_state()
 
+            # print("RETURNING FROM _COMPILE", guarded_code.guarded_code.code.co_name)
+            # dis.dis(guarded_code.guarded_code.code)
             return guarded_code
         except Exception as e:
             # NB: e's msg is mutated here to add user stack, but we DON'T want

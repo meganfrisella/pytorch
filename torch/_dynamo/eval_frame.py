@@ -529,6 +529,9 @@ class DynamoTLS(threading.local):
     # The id of the current stage
     current_stage = None
 
+    # The continuation function name that marks the beginning of each stage
+    stage_fns = {}
+
     # The current runtime microbatch
     current_mb = None
 
@@ -631,6 +634,7 @@ class _TorchDynamoContext:
         self.prior = unset
 
     def __call__(self, fn):
+        # print("Calling TorchDynamoContext on", fn)
         # public api for compiler config/options
         def get_compiler_config():
             return self.compiler_config

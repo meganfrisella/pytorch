@@ -1,326 +1,411 @@
 import ray
 import torch
+import argparse
 from torch import nn, optim
 from models.llama import Transformer, LLAMA_DEBUG, LLAMA_1B, LLAMA_3B, LLAMA_8B
 from torch.profiler import profile, record_function, ProfilerActivity
 from .llama_schedules import build_1f1b_schedule, build_gpipe_schedule, print_schedule
-from torch._dynamo.scheduling import Task, DAGEdge, execute_schedule
+from torch._dynamo.piper import Task, piper_exec, piper_setup, validate_schedule
 import time
 
-# ray.shutdown()
-ray.init(include_dashboard=True, namespace="llama")
-# torch.manual_seed(0)
-
-COMPARE_RAY_BASELINE = 0
-
-llama_config = LLAMA_3B
-loss_fn = torch.nn.CrossEntropyLoss()
-controller_device = 'cuda:0'
-
-batch_size = 64
-num_mbs = 4
-seq_len = 32
-warmup = 10
-iters = 100
-
-x = torch.randint(0, llama_config.vocab_size, (batch_size, seq_len)).to(controller_device)
-y = torch.zeros((batch_size, llama_config.vocab_size), dtype=torch.long).to(controller_device)
-
-print("loading model")
-
-model = Transformer(llama_config)
-# model = model.half()
-model.to(controller_device)
-
-print("loaded model")
-
-print("compiling model")
-
-from torch._dynamo.backends.debugging import eager
-compiled = torch.compile(model, distribute=True)
-compiled(x, dynamo_mb=42).get()
-torch._dynamo.eval_frame.dynamo_tls.currently_compiling = None
-stg1 = compiled._ray_actors[0]
-stg2 = compiled._ray_actors[1]
-
-ray.get(stg1.send_input.remote(x))
-ray.get(stg2.send_truth.remote(y))
-
-print("compiled model")
-
-# del model.tok_embeddings
-# del model.layers
-# del model.norm
-# del model.output
-# del model.freqs_cis
+def parse_args():
+    parser = argparse.ArgumentParser(description='Run LLaMA model with pipeline parallelism')
+    parser.add_argument('--model', choices=['LLAMA_DEBUG', 'LLAMA_1B', 'LLAMA_3B', 'LLAMA_8B'], default='LLAMA_DEBUG',
+                        help='Model configuration: LLAMA_DEBUG, LLAMA_1B, LLAMA_3B, or LLAMA_8B (default: LLAMA_DEBUG)')
+    parser.add_argument('--schedule', choices=['gpipe', '1f1b', 'interleaved-1f1b'], default='1f1b',
+                        help='Schedule type: gpipe, 1f1b, or interleaved-1f1b (default: 1f1b)')
+    parser.add_argument('--devices', type=int, choices=[2, 4], default=2,
+                        help='Number of devices/stages (default: 2)')
+    parser.add_argument('--batch_size', type=int, default=8,
+                        help='Batch size (default: 8)')
+    parser.add_argument('--num_mbs', type=int, default=4,
+                        help='Number of microbatches (default: 4)')
+    parser.add_argument('--seq_len', type=int, default=512,
+                        help='Sequence length (default: 512)')
+    parser.add_argument('--warmup', type=int, default=10,
+                        help='Number of warmup iterations (default: 10)')
+    parser.add_argument('--iters', type=int, default=50,
+                        help='Number of timing iterations (default: 50)')
+    parser.add_argument('--tracing', action='store_true', default=False,
+                        help='Enable tracing')
+    return parser.parse_args()
 
 
-# time microbatch schedules
+def print_cuda_memory_stats(device: str, message: str = "") -> None:
+    """Prints CUDA memory usage statistics for the specified device, including available memory.
 
-# "1F1B" schedule
+    Args:
+        device (str): The CUDA device identifier (e.g., 'cuda', 'cuda:0').
+        message (str): Optional message to describe what is being logged (e.g., "loaded model", "loaded batch").
+    """
+    torch.cuda.synchronize()
+    device_obj = torch.device(device)
+    device_idx = device_obj.index if device_obj.index is not None else 0
+    BYTES_IN_GB: int = 1024 ** 3
 
-# manual schedule
-def iter_1f1b_manual():
-    done_stg1 = []
-    done_stg2 = []
+    used_gb: float = torch.cuda.memory_allocated(device_idx) / BYTES_IN_GB
+    reserved_gb: float = torch.cuda.memory_reserved(device_idx) / BYTES_IN_GB
+    peak_gb: float = torch.cuda.max_memory_allocated(device_idx) / BYTES_IN_GB
 
-    out_ref = compiled(None, dynamo_mb=0)
-    for mb in range(1, num_mbs):
-        grad2, done2 = stg2.backward.options(num_returns=2).remote(mb-1, out_ref.get_ref(), loss_fn=loss_fn)
-        out_ref = compiled(None, dynamo_mb=mb)
-        _, done1 = stg1.backward.options(num_returns=2).remote(mb-1, grad2)
-        done_stg1.append(done1)
-        done_stg2.append(done2)
+    # Get total memory using torch.cuda.get_device_properties
+    total_gb: float = torch.cuda.get_device_properties(device_idx).total_memory / BYTES_IN_GB
+    available_gb: float = total_gb - reserved_gb
 
-    grad2, done2 = stg2.backward.options(num_returns=2).remote(num_mbs-1, out_ref.get_ref(), loss_fn=loss_fn)
-    _, done1 = stg1.backward.options(num_returns=2).remote(num_mbs-1, grad2)
-    done_stg1.append(done1)
-    done_stg2.append(done2)
-
-    upd2 = stg2.update.remote(*done_stg2)
-    upd1 = stg1.update.remote(*done_stg1)
-    ray.get([upd1, upd2])
-    # ray.wait([upd1, upd2], fetch_local=False)
-
-# build high-level schedule
-schedule = build_1f1b_schedule(num_mbs, 2)
-
-# move bubble to ensure correct scheduling with fused forwards
-schedule[0][2] = schedule[0][1]
-schedule[0][1] = None
-
-def iter_1f1b():
-    out = execute_schedule(compiled, schedule, [None], None, loss_fn)
-    ray.get(out)
-    # ray.wait(out, fetch_local=False)
-
-# warmup
-for _ in range(warmup):
-    iter_1f1b()
-
-# time
-start = time.perf_counter()
-for _ in range(iters):
-    iter_1f1b()
-end = time.perf_counter()
-
-print(
-    f"1F1B execute_schedule throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
-)
-print(
-    f"time: {(end - start)*1000000/iters:.0f} us"
-)
-
-time.sleep(1)
-# warmup
-for _ in range(warmup):
-    iter_1f1b_manual()
-
-# time
-start = time.perf_counter()
-for _ in range(iters):
-    iter_1f1b_manual()
-end = time.perf_counter()
-
-print(
-    f"1F1B manual schedule throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
-)
-print(
-    f"time: {(end - start)*1000000/iters:.0f} us"
-)
-
-
-# "GPIPE" schedule
-
-# manual schedule
-def iter_gpipe_manual():
-    fwd_refs = []
-    done_stg1 = []
-    done_stg2 = []
-
-    for mb in range(num_mbs):
-        out_ref = compiled(None, dynamo_mb=mb)
-        fwd_refs.append(out_ref)
-
-    for mb, out_ref in enumerate(fwd_refs):
-        grad2, done2 = stg2.backward.options(num_returns=2).remote(mb, out_ref.get_ref(), loss_fn=loss_fn)
-        grad1, done1 = stg1.backward.options(num_returns=2).remote(mb, grad2)
-        done_stg1.append(done1)
-        done_stg2.append(done2)
-
-    upd2 = stg2.update.remote(*done_stg2)
-    upd1 = stg1.update.remote(*done_stg1)
-    ray.get([upd1, upd2])
-    # ray.wait([upd1, upd2], fetch_local=False)
-
-# build high-level schedule
-schedule = build_gpipe_schedule(num_mbs, 2)
-
-def iter_gpipe():
-    out = execute_schedule(compiled, schedule, [None], None, loss_fn)
-    ray.get(out)
-    # ray.wait(out, fetch_local=False)
-
-print("gpipe auto")
-# warmup
-for _ in range(warmup):
-    iter_gpipe()
-
-# time
-start = time.perf_counter()
-for _ in range(iters):
-    iter_gpipe()
-end = time.perf_counter()
-
-print(
-    f"GPipe execute_schedule throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
-)
-print(
-    f"time: {(end - start)*1000000/iters:.0f} us"
-)
-
-# time.sleep(1)
-print("gpipe manual")
-# warmup
-for _ in range(warmup):
-    iter_gpipe_manual()
-
-# time
-start = time.perf_counter()
-for _ in range(iters):
-    iter_gpipe_manual()
-end = time.perf_counter()
-
-print(
-    f"GPipe manual schedule throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
-)
-print(
-    f"time: {(end - start)*1000000/iters:.0f} us"
-)
-
-
-# baseline: no distribution
-
-from models.llama_baseline import Transformer as BaseTransformer
-from torch._dynamo.backends.debugging import eager
-
-baseline = BaseTransformer(x, llama_config)
-baseline = baseline.half()
-baseline.to('cuda')
-print("loaded model")
-baseline = torch.compile(baseline, distribute=False, backend=eager)
-optim = torch.optim.Adam(baseline.parameters())
-
-def iter_baseline():
-    out = baseline(x)
-    loss = loss_fn(out, y)
-    loss.backward()
-    optim.step()
-    optim.zero_grad()
-
-for _ in range(warmup):
-    iter_baseline()
-
-# time
-start = time.perf_counter()
-for _ in range(iters):
-    iter_baseline()
-end = time.perf_counter()
-
-print(
-    f"Baseline throughput: {(iters * batch_size * seq_len)/(end - start):.0f} tokens/sec"
-)
-print(
-    f"time: {(end - start)*1000000/iters:.0f} us"
-)
-
-if COMPARE_RAY_BASELINE:
-    # baseline: Ray manual pipeline implementation - 1F1B
-
-    from models.llama_actor import LlamaActor
-
-    stg1_actor = LlamaActor.options(num_gpus=1).remote(llama_config, batch_size, seq_len, 0, num_mbs, 2)
-    stg2_actor = LlamaActor.options(num_gpus=1).remote(llama_config, batch_size, seq_len, 1, num_mbs, 2)
-    actors = [stg1_actor, stg2_actor]
-
-    # create nccl group and wait for it to be ready
-    from ray.experimental.collective import create_collective_group
-    create_collective_group(actors, backend="nccl")
-    ray.get([actor.init_training.remote() for actor in actors])
-    ray.get(stg1_actor.send_input.remote(x))
-    ray.get(stg2_actor.send_truth.remote(y))
-
-    for _ in range(warmup):
-        out1 = stg1_actor.forward.remote(0, None)
-        out2 = stg2_actor.forward.remote(0, out1)
-        ray.get(out2)
-
-
-
-    def iter_ray_baseline():
-        done_stg1 = []
-        done_stg2 = []
-
-        for mb in range(num_mbs):
-            out1 = stg1_actor.forward.remote(mb, None)
-            out2 = stg2_actor.forward.remote(mb, out1)
-            grad2 = stg2_actor.backward.remote(mb, out2, y)
-            grad1 = stg1_actor.backward.remote(mb, grad2)
-            done_stg2.append(grad2)
-            done_stg1.append(grad1)
-
-        upd2 = stg2_actor.update.remote(*done_stg2)
-        upd1 = stg1_actor.update.remote(*done_stg1)
-        ray.get([upd2, upd1])
-
-    # warmup
-    for _ in range(warmup):
-        iter_ray_baseline()
-
-    # time
-    start = time.perf_counter()
-    for _ in range(iters):
-        iter_ray_baseline()
-    end = time.perf_counter()
-
+    message_prefix = f":{message}" if message else ""
     print(
-        f"Ray 1F1B baseline throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
+        f"[CUDA:{device_idx}] Memory stats{message_prefix} | "
+        f"used={used_gb:.1f} GiB, reserved={reserved_gb:.1f} GiB, "
+        f"peak={peak_gb:.1f} GiB, available={available_gb:.1f} GiB, total={total_gb:.1f} GiB"
     )
 
-    # baseline: Ray manual pipeline implementation - GPipe
 
-    from models.llama_actor import LlamaActor
-
-    def iter_ray_baseline():
-        fwd_refs = []
-        done_stg1 = []
-        done_stg2 = []
+def main(args):
+    
+    # Set model configuration based on argument
+    if args.model == 'LLAMA_DEBUG':
+        llama_config = LLAMA_DEBUG
+    elif args.model == 'LLAMA_1B':
+        llama_config = LLAMA_1B
+    elif args.model == 'LLAMA_3B':
+        llama_config = LLAMA_3B
+    elif args.model == 'LLAMA_8B':
+        llama_config = LLAMA_8B
         
-        for mb in range(num_mbs):
-            out1 = stg1_actor.forward.remote(mb, None)
-            out2 = stg2_actor.forward.remote(mb, out1)
-            fwd_refs.append(out2)
+    loss_fn = torch.nn.CrossEntropyLoss()
+    device = 'cuda'
+    
+    batch_size = args.batch_size
+    num_mbs = args.num_mbs
+    num_devices = args.devices
+    seq_len = args.seq_len
+    warmup = args.warmup
+    iters = args.iters
 
-        for mb, fwd_ref in enumerate(fwd_refs):
-            grad2, done2 = stg2_actor.backward.options(num_returns=2).remote(mb, fwd_ref)
-            grad1, done1 = stg1_actor.backward.options(num_returns=2).remote(mb, grad2)
-            done_stg2.append(done2)
-            done_stg1.append(done1)
+    x = torch.randint(0, llama_config.vocab_size, (batch_size, seq_len)).to(device)
+    y = torch.zeros((batch_size, llama_config.vocab_size), dtype=torch.long).to(device)
 
-        upd2 = stg2_actor.update.remote(*done_stg2)
-        upd1 = stg1_actor.update.remote(*done_stg1)
-        ray.get([upd2, upd1])
+    # print_cuda_memory_stats(device, "after loading data")
+
+    model = Transformer(llama_config)
+    model.to(device)
+
+    # print_cuda_memory_stats(device, "after loading model")
+    compiled = piper_setup(model, [x])
+    # print_cuda_memory_stats(device, "after compiling model")
+    
+    actors = compiled._ray_actors
+    num_actors = len(actors)
+    assert num_actors == num_devices
+    ray.get(actors[0].send_input.remote(x))
+    ray.get(actors[num_actors-1].send_truth.remote(y))
+
+    schedule = None
+    if args.schedule == "interleaved-1f1b":
+        from .interleaved_grid_schedules import pp2_interleaved_1f1b_grid_schedule, pp4_interleaved_1f1b_grid_schedule
+        schedule = pp2_interleaved_1f1b_grid_schedule if num_devices == 2 else pp4_interleaved_1f1b_grid_schedule
+    elif args.schedule == "1f1b":
+        schedule = build_1f1b_schedule(num_mbs, num_devices)
+    elif args.schedule == "gpipe":
+        schedule = build_gpipe_schedule(num_mbs, num_devices)
+
+    print_schedule(schedule)
+
+    def iter_schedule():
+        out = piper_exec(compiled, schedule, [None], None, loss_fn, num_mbs)
+        ray.get(out)
+        # ray.wait(out, fetch_local=False)
+
+    iter_schedule()
+
+    import time
+    ray.get([actor.start_mem_tracing.remote() for actor in actors.values()])
+    iter_schedule()
+    time.sleep(3)
+    iter_schedule()
+    time.sleep(3)
+    iter_schedule()
+    ray.get([actor.stop_mem_tracing.remote() for actor in actors.values()])
+    exit()
+
+    # set tracing
+    ray.get([actor.set_tracing.remote(args.tracing) for actor in actors.values()])
+
+    if args.tracing:
+        if args.devices == 2 and args.schedule == "1f1b":
+            actor1 = actors[0]
+            actor2 = actors[1]
+            
+            # Collect timing data across multiple iterations
+            timing_results = {
+                'fwd_0_1': {'times': [], 'sizes': [], 'lengths': []},
+                'bwd_1_0': {'times': [], 'sizes': [], 'lengths': []}
+            }
+            
+            for iteration in range(iters):
+                # Forward pass timings
+                start_time = time.perf_counter()
+                ray.get(actor2.time_object_retrieval.remote(actor1.get_object.remote(True, 0)))
+                end_time = time.perf_counter()
+                fwd_0_1_time = (end_time - start_time) * 1000
+                timing_results['fwd_0_1']['times'].append(fwd_0_1_time)
+                
+                start_time = time.perf_counter()
+                ray.get(actor1.time_object_retrieval.remote(actor2.get_object.remote(False, 1)))
+                end_time = time.perf_counter()
+                bwd_1_0_time = (end_time - start_time) * 1000
+                timing_results['bwd_1_0']['times'].append(bwd_1_0_time)
+
+        if args.devices == 2 and args.schedule == "interleaved-1f1b":
+            actor1 = actors[0]
+            actor2 = actors[1]
+            
+            # Collect timing data across multiple iterations
+            timing_results = {
+                'fwd_0_1': {'times': [], 'sizes': [], 'lengths': []},
+                'fwd_1_2': {'times': [], 'sizes': [], 'lengths': []},
+                'fwd_2_3': {'times': [], 'sizes': [], 'lengths': []},
+                'bwd_3_2': {'times': [], 'sizes': [], 'lengths': []},
+                'bwd_2_1': {'times': [], 'sizes': [], 'lengths': []},
+                'bwd_1_0': {'times': [], 'sizes': [], 'lengths': []}
+            }
+            
+            for iteration in range(iters):
+                # Forward pass timings
+                start_time = time.perf_counter()
+                ray.get(actor2.time_object_retrieval.remote(actor1.get_object.remote(True, 0)))
+                end_time = time.perf_counter()
+                fwd_0_1_time = (end_time - start_time) * 1000
+                timing_results['fwd_0_1']['times'].append(fwd_0_1_time)
+                
+                start_time = time.perf_counter()
+                ray.get(actor1.time_object_retrieval.remote(actor2.get_object.remote(True, 1)))
+                end_time = time.perf_counter()
+                fwd_1_2_time = (end_time - start_time) * 1000
+                timing_results['fwd_1_2']['times'].append(fwd_1_2_time)
+                
+                start_time = time.perf_counter()
+                ray.get(actor2.time_object_retrieval.remote(actor1.get_object.remote(True, 2)))
+                end_time = time.perf_counter()
+                fwd_2_3_time = (end_time - start_time) * 1000
+                timing_results['fwd_2_3']['times'].append(fwd_2_3_time)
+                
+                # Backward pass timings
+                start_time = time.perf_counter()
+                ray.get(actor1.time_object_retrieval.remote(actor2.get_object.remote(False, 3)))
+                end_time = time.perf_counter()
+                bwd_3_2_time = (end_time - start_time) * 1000
+                timing_results['bwd_3_2']['times'].append(bwd_3_2_time)
+                
+                start_time = time.perf_counter()
+                ray.get(actor2.time_object_retrieval.remote(actor1.get_object.remote(False, 2)))
+                end_time = time.perf_counter()
+                bwd_2_1_time = (end_time - start_time) * 1000
+                timing_results['bwd_2_1']['times'].append(bwd_2_1_time)
+                
+                start_time = time.perf_counter()
+                ray.get(actor1.time_object_retrieval.remote(actor2.get_object.remote(False, 1)))
+                end_time = time.perf_counter()
+                bwd_1_0_time = (end_time - start_time) * 1000
+                timing_results['bwd_1_0']['times'].append(bwd_1_0_time)
+
+        if args.devices == 4 and args.schedule == "interleaved-1f1b":
+            actor1 = actors[0]
+            actor2 = actors[1]
+            actor3 = actors[2]
+            actor4 = actors[3]
+            
+            # Collect timing data across multiple iterations
+            timing_results = {
+                'fwd_0_1': {'times': [], 'sizes': [], 'lengths': []},
+                'fwd_1_2': {'times': [], 'sizes': [], 'lengths': []},
+                'fwd_2_3': {'times': [], 'sizes': [], 'lengths': []},
+                'fwd_3_4': {'times': [], 'sizes': [], 'lengths': []},
+                'fwd_4_5': {'times': [], 'sizes': [], 'lengths': []},
+                'fwd_5_6': {'times': [], 'sizes': [], 'lengths': []},
+                'fwd_6_7': {'times': [], 'sizes': [], 'lengths': []},
+                'bwd_7_6': {'times': [], 'sizes': [], 'lengths': []},
+                'bwd_6_5': {'times': [], 'sizes': [], 'lengths': []},
+                'bwd_5_4': {'times': [], 'sizes': [], 'lengths': []},
+                'bwd_4_3': {'times': [], 'sizes': [], 'lengths': []},
+                'bwd_3_2': {'times': [], 'sizes': [], 'lengths': []},
+                'bwd_2_1': {'times': [], 'sizes': [], 'lengths': []},
+                'bwd_1_0': {'times': [], 'sizes': [], 'lengths': []}
+            }
+            
+            # microbenchmark p2p communication time
+            for iteration in range(iters):
+                start_time = time.perf_counter()
+                ray.get(actor2.time_object_retrieval.remote(actor1.get_object.remote(True, 0)))
+                end_time = time.perf_counter()
+                fwd_0_1_time = (end_time - start_time) * 1000
+                timing_results['fwd_0_1']['times'].append(fwd_0_1_time)
+                
+                start_time = time.perf_counter()
+                ray.get(actor3.time_object_retrieval.remote(actor2.get_object.remote(True, 1)))
+                end_time = time.perf_counter()
+                fwd_1_2_time = (end_time - start_time) * 1000
+                timing_results['fwd_1_2']['times'].append(fwd_1_2_time)
+                
+                start_time = time.perf_counter()
+                ray.get(actor4.time_object_retrieval.remote(actor3.get_object.remote(True, 2)))
+                end_time = time.perf_counter()
+                fwd_2_3_time = (end_time - start_time) * 1000
+                timing_results['fwd_2_3']['times'].append(fwd_2_3_time)
+                
+                start_time = time.perf_counter()
+                ray.get(actor1.time_object_retrieval.remote(actor4.get_object.remote(True, 3)))
+                end_time = time.perf_counter()
+                fwd_3_4_time = (end_time - start_time) * 1000
+                timing_results['fwd_3_4']['times'].append(fwd_3_4_time)
+
+                start_time = time.perf_counter()
+                ray.get(actor2.time_object_retrieval.remote(actor1.get_object.remote(True, 4)))
+                end_time = time.perf_counter()
+                fwd_4_5_time = (end_time - start_time) * 1000
+                timing_results['fwd_4_5']['times'].append(fwd_4_5_time)
+
+                start_time = time.perf_counter()
+                ray.get(actor3.time_object_retrieval.remote(actor2.get_object.remote(True, 5)))
+                end_time = time.perf_counter()
+                fwd_5_6_time = (end_time - start_time) * 1000
+                timing_results['fwd_5_6']['times'].append(fwd_5_6_time)
+
+                start_time = time.perf_counter()
+                ray.get(actor4.time_object_retrieval.remote(actor3.get_object.remote(True, 6)))
+                end_time = time.perf_counter()
+                fwd_6_7_time = (end_time - start_time) * 1000
+                timing_results['fwd_6_7']['times'].append(fwd_6_7_time)
+
+                # Backward pass timings
+                start_time = time.perf_counter()
+                ray.get(actor3.time_object_retrieval.remote(actor4.get_object.remote(False, 7)))
+                end_time = time.perf_counter()
+                bwd_7_6_time = (end_time - start_time) * 1000
+                timing_results['bwd_7_6']['times'].append(bwd_7_6_time) 
+
+                start_time = time.perf_counter()
+                ray.get(actor2.time_object_retrieval.remote(actor3.get_object.remote(False, 6)))
+                end_time = time.perf_counter()
+                bwd_6_5_time = (end_time - start_time) * 1000
+                timing_results['bwd_6_5']['times'].append(bwd_6_5_time)
+
+                start_time = time.perf_counter()
+                ray.get(actor1.time_object_retrieval.remote(actor2.get_object.remote(False, 5)))
+                end_time = time.perf_counter()
+                bwd_5_4_time = (end_time - start_time) * 1000
+                timing_results['bwd_5_4']['times'].append(bwd_5_4_time)
+
+                start_time = time.perf_counter()
+                ray.get(actor4.time_object_retrieval.remote(actor1.get_object.remote(False, 4)))
+                end_time = time.perf_counter()
+                bwd_4_3_time = (end_time - start_time) * 1000
+                timing_results['bwd_4_3']['times'].append(bwd_4_3_time)
+
+                start_time = time.perf_counter()
+                ray.get(actor3.time_object_retrieval.remote(actor4.get_object.remote(False, 3)))
+                end_time = time.perf_counter()
+                bwd_3_2_time = (end_time - start_time) * 1000
+                timing_results['bwd_3_2']['times'].append(bwd_3_2_time)
+                
+                start_time = time.perf_counter()
+                ray.get(actor2.time_object_retrieval.remote(actor3.get_object.remote(False, 2)))
+                end_time = time.perf_counter()
+                bwd_2_1_time = (end_time - start_time) * 1000
+                timing_results['bwd_2_1']['times'].append(bwd_2_1_time)
+                
+                start_time = time.perf_counter()
+                ray.get(actor1.time_object_retrieval.remote(actor2.get_object.remote(False, 1)))
+                end_time = time.perf_counter()
+                bwd_1_0_time = (end_time - start_time) * 1000
+                timing_results['bwd_1_0']['times'].append(bwd_1_0_time)
+
+        # Calculate and report average statistics
+        import numpy as np
+        
+        print(f"\n=== Average P2P Transfer Statistics ===")
+        for transfer_name, data in timing_results.items():
+            avg_time = np.mean(data['times'])
+            std_time = np.std(data['times'])
+            
+            print(f"{transfer_name}: {avg_time:.2f} ± {std_time:.2f} ms")
+        print()
 
     # warmup
     for _ in range(warmup):
-        iter_ray_baseline()
+        iter_schedule()
+
+    # clear timing data
+    ray.get([actor.clear_trace_data.remote() for actor in actors.values()])
 
     # time
     start = time.perf_counter()
     for _ in range(iters):
-        iter_ray_baseline()
+        iter_schedule()
     end = time.perf_counter()
 
+    def print_mean_timing_data(trace_data: dict, actor_id: int) -> None:
+        """Prints mean timing and memory statistics from trace_data for a given actor.
+
+        Args:
+            trace_data (dict): Trace data dictionary from the actor containing timing and memory metrics.
+            actor_id (int): The ID of the actor.
+        """
+        import numpy as np
+
+        print(f"\nTiming and Memory statistics for Actor {actor_id}:")
+        
+        for stage_id, stage_data in trace_data.items():
+            if stage_id == 'update':
+                # Handle update data (global optimizer step)
+                print(f"  Update:")
+                for metric, values in stage_data.items():
+                    if not values:
+                        mean_val = float('nan')
+                    else:
+                        mean_val = float(np.mean(values))
+                    
+                    if 'memory' in metric:
+                        if 'delta' in metric:
+                            print(f"    {metric}: {mean_val:.3f} GB")
+                        else:
+                            print(f"    {metric}: {mean_val:.3f} GB")
+                    else:
+                        print(f"    {metric}: {mean_val:.3f} ms")
+            else:
+                # Handle stage data (forward/backward passes)
+                print(f"  Stage {stage_id}:")
+                for phase, phase_data in stage_data.items():
+                    print(f"    {phase.capitalize()}:")
+                    for metric, values in phase_data.items():
+                        if not values:
+                            mean_val = float('nan')
+                        else:
+                            mean_val = float(np.mean(values))
+                        
+                        if 'memory' in metric:
+                            if 'delta' in metric:
+                                print(f"      {metric}: {mean_val:.3f} GB")
+                            else:
+                                print(f"      {metric}: {mean_val:.3f} GB")
+                        else:
+                            print(f"      {metric}: {mean_val:.3f} ms")
+
+    for actor in actors.values():
+        trace_data = ray.get(actor.get_trace_data.remote())
+        actor_id = ray.get(actor.id.remote())
+        print_mean_timing_data(trace_data, actor_id)
+
     print(
-        f"Ray GPipe baseline throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
+        f"{args.schedule} throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
     )
+    print(
+        f"time: {(end - start)*1000000/iters:.0f} us"
+    )
+
+    ray.timeline(f"{args.model}-pp{num_devices}-{args.schedule}.json")
+
+if __name__ == "__main__":
+    ray.init(include_dashboard=True, namespace="llama")
+    torch.manual_seed(0)
+    args = parse_args()
+    main(args)

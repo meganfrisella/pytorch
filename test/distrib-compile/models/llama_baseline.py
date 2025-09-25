@@ -406,9 +406,8 @@ class Transformer(nn.Module):
             params.rope_theta,
         )
 
-    def forward(self):
-        tokens = self.input
-        
+    def forward(self, tokens):
+
         seqlen = tokens.shape[1]
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 

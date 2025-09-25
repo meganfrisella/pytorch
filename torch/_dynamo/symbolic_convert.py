@@ -3302,6 +3302,12 @@ class InstructionTranslatorBase(
         linecache.lazycache(f_code.co_filename, f_globals)
 
 
+CONT_REGISTRY = {}
+
+def _register_cont_fn(name, fn):
+    CONT_REGISTRY[name] = fn
+    return fn
+
 class InstructionTranslator(InstructionTranslatorBase):
     @staticmethod
     def current_tx() -> "InstructionTranslator":
@@ -3341,6 +3347,7 @@ class InstructionTranslator(InstructionTranslatorBase):
             logging.INFO,
             f"torchdynamo start tracing {f_code.co_name} {code_options['co_filename']}:{code_options['co_firstlineno']}",
         )
+        self.closure = closure
         super().__init__(
             output=OutputGraph(
                 code_options,
@@ -3647,12 +3654,20 @@ class InstructionTranslator(InstructionTranslatorBase):
 
         if new_code.co_freevars:
             # expose code object for debugging purposes
-            self.output.install_global_unsafe(name, new_code)
+            # print("FREEVARS", name)
+            # fn = types.FunctionType(new_code, self.f_globals, name, closure=(types.CellType(self.f_locals["self"]),))
+            # CONT_REGISTRY[name] = fn
+            self.output.install_global_unsafe(
+                name, new_code
+            )
             cg.make_function_with_closure(name, new_code, True, stack_len)
         else:
+            # print("NO FREEVARS", name)
             # This is safe: we pre-generate a unique name
+            fn = types.FunctionType(new_code, self.f_globals, name)
+            # CONT_REGISTRY[name] = fn
             self.output.install_global_unsafe(
-                name, types.FunctionType(new_code, self.f_globals, name)
+                name, fn
             )
             cg.extend_output(cg.load_function_name(name, True, stack_len))
 

@@ -38,6 +38,7 @@ from typing import Any, Callable, cast, Optional, TYPE_CHECKING, Union
 
 import io
 import sympy
+import types
 
 import torch._guards
 import torch._logging
@@ -153,7 +154,7 @@ from .variables.torch_function import TensorWithTFOverrideVariable
 from .eval_frame import dynamo_tls
 
 import ray
-from .distribute_ray import RemoteTensor, get_fake_tensors
+from .distribute_ray import RemoteTensor
 
 if TYPE_CHECKING:
     from torch._dynamo.symbolic_convert import InstructionTranslatorBase
@@ -1689,16 +1690,9 @@ class OutputGraph(OutputGraphGuardsState):
                 compiler_fn = WrapperBackend(compiler_fn)
 
 
-            # print(f"Compiling function {self.better_compile_id} for stage {dynamo_tls.current_stage}")
-            # gm.print_readable()
-
-
             if self.distribute:
 
-                # serialize the fx.Graph to compile on the actor
-                graph_module_buf = io.BytesIO()
-                torch.save(gm, graph_module_buf)
-                graph_module_buf.seek(0)
+                # print(f"Compiling function {self.better_compile_id} for stage {dynamo_tls.current_stage}")
 
                 # make sure the example inputs are serializable by turning
                 # symbolic ints and fake tensors into concrete values
@@ -1729,28 +1723,13 @@ class OutputGraph(OutputGraphGuardsState):
 
                 parameters = []
                 new_graphargs = []
-                mod = dynamo_tls.torch_module
-
-                def get_param(base: Source):
-                    if isinstance(base, ChainedSource):
-                        resource = get_param(base.base)
-                        if isinstance(base, AttrSource):
-                            return getattr(resource, base.member)
-                        elif isinstance(base, DictGetItemSource):
-                            return resource[base.index]
-                        elif isinstance(base, NNModuleSource):
-                            return resource
-                        
-                    elif isinstance(base, LocalSource):
-                        assert base.local_name == "self"
-                        return mod._orig_mod
-                    
-                    log.warn(f"got Source type {type(base)}")
-                    assert False and "Got unexpected Source type"
-
-                for idx, arg in enumerate(self.graphargs):
+                for arg in self.graphargs:
                     if "self" in str(arg):
-                        parameters.append(get_param(arg.source))
+                        # print("arg:", type(arg.example))
+                        if isinstance(arg.example, torch.SymInt):
+                            parameters.append(int(arg.example))
+                        else:
+                            parameters.append(arg.example)
                     else:
                         parameters.append(None)
                         new_graphargs.append(arg)
@@ -1758,29 +1737,40 @@ class OutputGraph(OutputGraphGuardsState):
                 assert len(new_graphargs) == len(list(filter(lambda a: a is None, parameters)))
                 self.override_graphargs = new_graphargs
 
+                from .distribute_ray import serialize_graphmodule
+                payload = serialize_graphmodule(gm)
+
                 # instantiate a Ray actor and send the fx.Graph to get compiled
                 stage_id = dynamo_tls.current_stage
-                actor = dynamo_tls.torch_module._ray_actors[stage_id]
+                actor_id = dynamo_tls.current_actor
+                actor = dynamo_tls.torch_module._ray_actors[actor_id]
                 compile_id = self.better_compile_id
+
                 ray.get(
                     actor.compile_graph.remote(
                         compile_id,
-                        graph_module_buf,
+                        stage_id,
+                        payload,
                         compiler_fn,
                         serializable_example_inputs,
                         parameters,
                     )
                 )
 
-                # fakes = get_fake_tensors(example_inputs, gm)
-                def symint_to_tensor(x):
-                    return torch.tensor(x) if not isinstance(x, FakeTensor) else x
-                fakes = list(map(symint_to_tensor, get_fake_tensors(example_inputs, gm)))
+                def symint_to_int(x):
+                    return int(x) if isinstance(x, torch.SymInt) else x
+
+                fakes = gm(*list(map(symint_to_int, example_inputs)))
+
+                def int_to_tensor(x):
+                    return torch.tensor(x) if isinstance(x, int) else x
+                fakes = list(map(int_to_tensor, fakes))
 
                 # the returned function makes a remote call to the compiled fx.Graph
                 # return the resulting Ray ObjectRef as a RemoteTensor, which additionally
                 # requires the fx.Graph and example inputs to compute the RemoteTensor shape
                 def overwrite_compiled_fn(*args):
+                    mb_idx = torch._dynamo.eval_frame.dynamo_tls.current_mb
                     # track stage dependencies
                     for arg in args:
                         if isinstance(arg, RemoteTensor):
@@ -1791,12 +1781,13 @@ class OutputGraph(OutputGraphGuardsState):
                         return x.get_ref() if isinstance(x, RemoteTensor) else x
                     args = list(map(unwrap, args))
 
-                    mb_idx = torch._dynamo.eval_frame.dynamo_tls.current_mb
                     if torch._dynamo.eval_frame.dynamo_tls.currently_compiling:
                         # dispatch task without nccl transport
-                        refs = actor.call_cpu.options(num_returns=len(fakes)).remote(compile_id, mb_idx, *args)
+                        refs = actor.call_cpu.options(num_returns=len(fakes)).remote(compile_id, stage_id, mb_idx, *args)
                     else:
-                        refs = actor.call.options(num_returns=len(fakes)).remote(compile_id, mb_idx, *args)
+                        refs = actor.call.options(num_returns=len(fakes)).remote(compile_id, stage_id, mb_idx, *args)
+
+                    # print(f"Stage {stage_id} forward outputs: {refs}")
 
                     if isinstance(refs, list):
                         assert len(fakes) == len(refs)
@@ -2078,6 +2069,11 @@ class OutputGraph(OutputGraphGuardsState):
         a global installed by another instance. This can happen if we mangle
         a global the same way across both instances.
         """
+        if "__resume_at_" in name and isinstance(value, types.FunctionType):
+            log.info("Install global %s %s", value, name)
+            # print("Install global", value, name)
+            torch._dynamo.convert_frame.output_codes.map_name(value.__qualname__, name)
+
         assert name not in self.installed_globals
         self.installed_globals.add(name)
         self.cleanups.append(CleanupHook.create(self.global_scope, name, value))

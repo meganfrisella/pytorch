@@ -479,11 +479,11 @@ class PipelineScheduleSingle(_PipelineSchedule):
         self._stage.has_backward = self._has_backward
         self._stage_initialized = False
 
-        if n_microbatches < self._num_stages:
-            raise ValueError(
-                f"Number of microbatches ({n_microbatches}) must be greater than \
-or equal to the number of stages ({self._num_stages})."
-            )
+#         if n_microbatches < self._num_stages:
+#             raise ValueError(
+#                 f"Number of microbatches ({n_microbatches}) must be greater than \
+# or equal to the number of stages ({self._num_stages})."
+#             )
 
     def _initialize_stage(self, args, kwargs):
         self._stage._prepare_forward_infra(self._n_microbatches, args, kwargs)
@@ -555,19 +555,19 @@ class _ScheduleForwardOnly(PipelineScheduleSingle):
 
         # Run microbatches
         for i in range(self._n_microbatches):
-            with record_function(f"Forward {i}"):
-                ops = self._stage.get_fwd_recv_ops(i)
-                works = _sorted_batch_p2p(ops, desc="fwd_recv")
-                for work in works.values():
-                    _wait_batch_p2p(work)
+            # with record_function(f"Forward {i}"):
+            ops = self._stage.get_fwd_recv_ops(i)
+            works = _sorted_batch_p2p(ops, desc="fwd_recv")
+            for work in works.values():
+                _wait_batch_p2p(work)
 
-                self._stage.forward_one_chunk(i, arg_mbs[i], kwarg_mbs[i])  # type: ignore[index]
+            self._stage.forward_one_chunk(i, arg_mbs[i], kwarg_mbs[i])  # type: ignore[index]
 
-                ops = self._stage.get_fwd_send_ops(i)
-                works = _sorted_batch_p2p(ops, desc="fwd_send")
-                fwd_sends_to_wait.extend(works.values())
+            ops = self._stage.get_fwd_send_ops(i)
+            works = _sorted_batch_p2p(ops, desc="fwd_send")
+            fwd_sends_to_wait.extend(works.values())
 
-            logger.debug("[%s] Forwarded microbatch %s", self._stage.stage_index, i)
+            # logger.debug("[%s] Forwarded microbatch %s", self._stage.stage_index, i)
 
         # Wait for all forward sends to finish
         # This should not have performance impact because by the time the first

@@ -4,8 +4,9 @@ import argparse
 from torch import nn, optim
 from models.llama import Transformer, LLAMA_DEBUG, LLAMA_1B, LLAMA_3B, LLAMA_8B
 from torch.profiler import profile, record_function, ProfilerActivity
-from .llama_schedules import build_1f1b_schedule, build_gpipe_schedule, print_schedule
-from torch._dynamo.piper import Task, piper_exec, piper_setup, validate_schedule
+from utils.llama_schedules import build_1f1b_schedule, build_gpipe_schedule, print_schedule
+from torch.piper.piper_exec import Task, piper_exec
+from torch.piper.piper_compile import piper_setup
 import time
 
 def parse_args():
@@ -22,10 +23,10 @@ def parse_args():
                         help='Number of microbatches (default: 4)')
     parser.add_argument('--seq_len', type=int, default=512,
                         help='Sequence length (default: 512)')
-    parser.add_argument('--warmup', type=int, default=10,
-                        help='Number of warmup iterations (default: 10)')
-    parser.add_argument('--iters', type=int, default=50,
-                        help='Number of timing iterations (default: 50)')
+    parser.add_argument('--warmup', type=int, default=5,
+                        help='Number of warmup iterations (default: 5)')
+    parser.add_argument('--iters', type=int, default=20,
+                        help='Number of timing iterations (default: 20)')
     parser.add_argument('--tracing', action='store_true', default=False,
                         help='Enable tracing')
     return parser.parse_args()
@@ -90,7 +91,8 @@ def main(args):
     model.to(device)
 
     # print_cuda_memory_stats(device, "after loading model")
-    compiled = piper_setup(model, [x])
+    from torch._dynamo.backends.piper import piper
+    compiled = piper_setup(model, [x], backend=piper)
     # print_cuda_memory_stats(device, "after compiling model")
     
     actors = compiled._ray_actors
@@ -115,22 +117,12 @@ def main(args):
         ray.get(out)
         # ray.wait(out, fetch_local=False)
 
-    iter_schedule()
-
-    import time
-    ray.get([actor.start_mem_tracing.remote() for actor in actors.values()])
-    iter_schedule()
-    time.sleep(3)
-    iter_schedule()
-    time.sleep(3)
-    iter_schedule()
-    ray.get([actor.stop_mem_tracing.remote() for actor in actors.values()])
-    exit()
-
     # set tracing
     ray.get([actor.set_tracing.remote(args.tracing) for actor in actors.values()])
 
     if args.tracing:
+        iter_schedule()
+
         if args.devices == 2 and args.schedule == "1f1b":
             actor1 = actors[0]
             actor2 = actors[1]
@@ -390,11 +382,6 @@ def main(args):
                         else:
                             print(f"      {metric}: {mean_val:.3f} ms")
 
-    for actor in actors.values():
-        trace_data = ray.get(actor.get_trace_data.remote())
-        actor_id = ray.get(actor.id.remote())
-        print_mean_timing_data(trace_data, actor_id)
-
     print(
         f"{args.schedule} throughput: {(iters * batch_size * num_mbs * seq_len)/(end - start):.0f} tokens/sec"
     )
@@ -402,7 +389,12 @@ def main(args):
         f"time: {(end - start)*1000000/iters:.0f} us"
     )
 
-    ray.timeline(f"{args.model}-pp{num_devices}-{args.schedule}.json")
+    if args.tracing:
+        for actor in actors.values():
+            trace_data = ray.get(actor.get_trace_data.remote())
+            actor_id = ray.get(actor.id.remote())
+            print_mean_timing_data(trace_data, actor_id)
+        ray.timeline(f"out/{args.model}-pp{num_devices}-{args.schedule}.json")
 
 if __name__ == "__main__":
     ray.init(include_dashboard=True, namespace="llama")

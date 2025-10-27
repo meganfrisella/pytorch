@@ -748,7 +748,7 @@ def _compile(
     ) -> None:
         # Instead of tracing RemoteTensors, trace their
         # FakeTensor representation
-        from .distribute_ray import RemoteTensor
+        from torch.piper.utils import RemoteTensor
         for k, v in locals.items():
             if isinstance(v, RemoteTensor):
                 locals[k] = v._fake

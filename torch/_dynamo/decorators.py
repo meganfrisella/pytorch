@@ -286,7 +286,7 @@ def graph_break(msg=""):
     """Force a graph break"""
 
 
-from .distribute_ray import StageActor
+from torch.piper.piper_actor import StageActor
 from .eval_frame import dynamo_tls
 
 

@@ -3361,7 +3361,6 @@ class InstructionTranslator(InstructionTranslatorBase):
                 global_scope=f_globals,
                 f_code=f_code,
                 torch_function_mode_stack=torch_function_mode_stack,
-                distribute=distribute,
             ),
             instructions=instructions,
             f_locals=f_locals,
@@ -3379,7 +3378,6 @@ class InstructionTranslator(InstructionTranslatorBase):
             speculation_log=speculation_log,
             exn_vt_stack=exn_vt_stack,
             distributed_state=distributed_state,
-            distribute=distribute,
         )
 
         
